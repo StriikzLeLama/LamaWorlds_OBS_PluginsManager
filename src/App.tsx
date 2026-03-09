@@ -1,10 +1,11 @@
 /**
- * LamaWorlds OBS Addon Manager - Main UI
+ * LamaWorlds OBS Plugin Manager - Main UI
  *
  * Manages OBS plugins: list, install from forum/URL, disable/enable, uninstall.
  * Pages: Home (plugins), Options (config), Discover (forum catalog).
  */
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { invoke, openFolderDialog } from "./tauriApi";
 import { ask, save, open } from "@tauri-apps/plugin-dialog";
 import logo from "./image/logo_64x64.png";
@@ -50,6 +51,7 @@ interface ForumPlugin {
   downloads?: number | null;
   updated?: string | null;
   icon_url?: string | null;
+  prefix?: string | null;
 }
 
 interface PluginUpdateInfo {
@@ -80,6 +82,7 @@ type StatusFilter = "all" | "active" | "disabled";
 const OBS_FORUM_PLUGINS_URL = "https://obsproject.com/forum/plugins/";
 const MAX_ACTION_LOG = 20;
 
+/** Formats a Unix timestamp (seconds) as locale date string. */
 function formatDate(ts: number | null | undefined): string {
   if (!ts) return "—";
   const d = new Date(ts * 1000);
@@ -90,6 +93,10 @@ function formatDate(ts: number | null | undefined): string {
   });
 }
 
+/**
+ * Home page: lists installed OBS plugins with search, sort, filter.
+ * Shows paths, plugin actions (disable/enable/uninstall), and action history.
+ */
 function HomePage({
   plugins,
   paths,
@@ -149,6 +156,7 @@ function HomePage({
       paths.appdata_plugins ||
       paths.custom_obs_install_path);
 
+  // Filter by status (all/active/disabled), search query, then sort
   const filteredPlugins = useMemo(() => {
     let list = [...plugins];
     if (statusFilter === "active") list = list.filter((p) => p.enabled);
@@ -244,6 +252,7 @@ function HomePage({
               value={statusFilter}
               onChange={(e) => onStatusFilterChange(e.target.value as StatusFilter)}
               className="select-sm"
+              aria-label="Filter by status (all, active, disabled)"
             >
               <option value="all">{t.all}</option>
               <option value="active">{t.active}</option>
@@ -253,6 +262,7 @@ function HomePage({
               value={sortBy}
               onChange={(e) => onSortChange(e.target.value as SortBy)}
               className="select-sm"
+              aria-label="Sort plugins by name, path, or date"
             >
               <option value="name">{t.name}</option>
               <option value="path">{t.path}</option>
@@ -267,7 +277,7 @@ function HomePage({
             <button type="button" className="btn btn-ghost btn-sm" onClick={onExportPluginsCsv} title="Export list as CSV">
               {t.exportCsv}
             </button>
-            <label className="compact-toggle" title="Denser list">
+            <label className="compact-toggle" title="Denser list" aria-label="Use compact plugin list">
               <input type="checkbox" checked={compactMode} onChange={(e) => onCompactModeChange(e.target.checked)} />
               <span>{t.compact}</span>
             </label>
@@ -369,8 +379,12 @@ function HomePage({
 type ForumSort = "name" | "id" | "downloads" | "rating";
 type ForumCategory = "plugins" | "themes" | "tools" | "scripts";
 
-const PLUGINS_PER_PAGE = 12;
+const PLUGINS_PER_PAGE = 24;
 
+/**
+ * Discover page: OBS forum plugins, install from URL, drag-drop, download modal.
+ * Fetches/scrapes forum, supports search, favorites, category switching.
+ */
 function DiscoverPage({
   installedPluginNames,
   favorites,
@@ -420,7 +434,7 @@ function DiscoverPage({
       setDownloadModal({ plugin, options: [], loading: true });
       try {
         const opts = await invoke<DownloadOption[]>("fetch_plugin_download_options", {
-          resource_url: plugin.url,
+          resourceUrl: plugin.url,
         });
         setDownloadModal((m) => (m ? { ...m, options: opts, loading: false } : null));
       } catch (e) {
@@ -441,7 +455,7 @@ function DiscoverPage({
       const list = await invoke<ForumPlugin[]>("fetch_forum_plugins", {
         category: cat,
         forceRefresh,
-        maxPages: 3,
+        maxPages: 5,
       });
       setForumPlugins(list);
       setForumFetched(true);
@@ -452,6 +466,12 @@ function DiscoverPage({
       setForumLoading(false);
     }
   }, [forumFetched, forumCategory]);
+
+  // Load forum plugins on mount (run once with default category)
+  useEffect(() => {
+    loadForumPlugins(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: run once on mount
+  }, []);
 
   const searchForum = useCallback(async () => {
     const q = forumSearch.trim();
@@ -511,7 +531,6 @@ function DiscoverPage({
     return filteredForumPlugins.slice(start, start + PLUGINS_PER_PAGE);
   }, [filteredForumPlugins, currentPage]);
 
-  const featuredPlugins = filteredForumPlugins.slice(0, 3);
   const topResources = filteredForumPlugins.slice(0, 5);
 
   const isInstalled = useCallback(
@@ -588,7 +607,7 @@ function DiscoverPage({
       <div className="card discover-forum-card discover-toolbar-card">
         <div className="card-header discover-forum-header">
           <div>
-            <h2>{t.forumAddons}</h2>
+            <h2>{t.forumPlugins}</h2>
             <p className="card-desc">{t.forumDesc}</p>
           </div>
           <div className="btn-row">
@@ -636,6 +655,7 @@ function DiscoverPage({
             value={installUrl}
             onChange={(e) => setInstallUrl(e.target.value)}
             className="input input-sm"
+            aria-label="Plugin ZIP or DLL URL to install"
           />
           <button type="button" className="btn btn-primary btn-sm" onClick={async () => {
             if (!installUrl.trim()) return;
@@ -648,6 +668,7 @@ function DiscoverPage({
             {installLoading ? t.installing : t.install}
           </button>
         </div>
+        <p className="install-drop-hint">{t.dragDropHint}</p>
       </div>
 
       {forumLoading && (
@@ -712,39 +733,15 @@ function DiscoverPage({
           </aside>
 
           <main className="discover-main">
-            <h1 className="discover-page-title">OBS Studio Plugins</h1>
-            <p className="discover-page-subtitle">Plugins for use with OBS Studio.</p>
-
-            {featuredPlugins.length > 0 && (
-              <section className="discover-featured">
-                <h3 className="section-label">{t.featured}</h3>
-                <div className="featured-grid">
-                  {featuredPlugins.map((p) => (
-                    <div key={p.id} className="featured-card">
-                      {p.icon_url ? (
-                        <img src={p.icon_url} alt="" className="featured-icon-img" />
-                      ) : (
-                        <div className="featured-icon" />
-                      )}
-                      <h4 className="featured-title">{p.title}</h4>
-                      <p className="featured-desc">{p.description || `${p.author || ""}`.trim() || "—"}</p>
-                      <div className="featured-meta">{p.author || "—"} · {p.downloads != null ? `${p.downloads.toLocaleString()} downloads` : p.id}</div>
-                      {p.rating && <span className="featured-rating">★ {p.rating}{p.rating_count ? ` (${p.rating_count})` : ""}</span>}
-                      <div className="featured-btns">
-                        {!readOnly && (
-                          <button type="button" className="btn btn-primary btn-sm" onClick={() => openDownloadModal(p)} title="Choose download variant">
-                            {t.install}
-                          </button>
-                        )}
-                        <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenPluginUrl(p.url)}>
-                          {t.viewOnForum}
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </section>
-            )}
+            <div className="discover-header-row">
+              <h1 className="discover-page-title">
+                {forumCategory === "plugins" ? "OBS Studio Plugins" : forumCategory.charAt(0).toUpperCase() + forumCategory.slice(1)}
+              </h1>
+              <span className="discover-live-badge" title="Data from obsproject.com/forum">● Live · obsproject.com</span>
+            </div>
+            <p className="discover-page-subtitle">
+              {forumCategory === "plugins" ? "Plugins for use with OBS Studio." : `OBS ${forumCategory} from the forum.`}
+            </p>
 
             <div className="discover-filters">
               <input
@@ -756,11 +753,11 @@ function DiscoverPage({
                 onChange={(e) => { setForumSearch(e.target.value); setCurrentPage(1); }}
                 aria-label="Search plugins"
               />
-              <label className="forum-filter-favorites">
+              <label className="forum-filter-favorites" aria-label="Show favorites only">
                 <input type="checkbox" checked={showFavoritesOnly} onChange={(e) => setShowFavoritesOnly(e.target.checked)} />
                 <span>{t.favorites}</span>
               </label>
-              <select className="select-sm" value={forumSort} onChange={(e) => setForumSort(e.target.value as ForumSort)}>
+              <select className="select-sm" value={forumSort} onChange={(e) => setForumSort(e.target.value as ForumSort)} aria-label="Sort forum resources">
                 <option value="name">{t.sortByName}</option>
                 <option value="id">{t.sortByRecent}</option>
                 <option value="downloads">Sort by downloads</option>
@@ -780,48 +777,41 @@ function DiscoverPage({
               </button>
             </div>
 
-            <div className="forum-plugins-list forum-plugins-detailed">
+            <div className="forum-resources-grid">
               {filteredForumPlugins.length === 0 ? (
-                <p className="empty-hint">{showFavoritesOnly ? t.noFavorite : t.noAddon}</p>
+                <p className="empty-hint grid-full">{showFavoritesOnly ? t.noFavorite : t.noForumPlugin}</p>
               ) : (
                 paginatedPlugins.map((p) => (
-                  <div key={p.id} className="forum-plugin-card forum-plugin-card-detailed">
-                    {p.icon_url ? (
-                      <img src={p.icon_url} alt="" className="forum-plugin-icon-img" />
-                    ) : (
-                      <div className="forum-plugin-icon" />
-                    )}
-                    <div className="forum-plugin-info">
-                      <div className="forum-plugin-title-row">
-                        <h3 className="forum-plugin-title">{p.title}{p.version ? ` ${p.version}` : ""}</h3>
-                        <div className="forum-plugin-badges">
-                          {isInstalled(p.title) && <span className="badge badge-installed">{t.installed}</span>}
-                          <button type="button" className={`btn-icon favorite-btn ${favorites.includes(p.id) ? "is-favorite" : ""}`} onClick={() => onToggleFavorite(p.id)} title={favorites.includes(p.id) ? t.removeFromFav : t.addToFav} aria-label={favorites.includes(p.id) ? "Remove from favorites" : "Add to favorites"}>♥</button>
+                  <article key={p.id} className="resource-card">
+                    <div className="resource-card-header">
+                      {p.icon_url ? (
+                        <img src={p.icon_url} alt="" className="resource-card-icon" />
+                      ) : (
+                        <div className="resource-card-icon resource-card-icon-placeholder" />
+                      )}
+                      <div className="resource-card-title-block">
+                        <h3 className="resource-card-title">{p.title}{p.version ? ` ${p.version}` : ""}</h3>
+                        <div className="resource-card-meta">
+                          {p.prefix && <span className="resource-prefix">{p.prefix}</span>}
+                          <span>{p.author || "—"}</span>
                         </div>
                       </div>
-                      <div className="forum-plugin-meta">
-                        {p.author || "—"}
-                        {p.downloads != null && <> · {p.downloads.toLocaleString()} downloads</>}
-                        {p.updated && <> · Updated {p.updated}</>}
+                      <div className="resource-card-badges">
+                        {isInstalled(p.title) && <span className="badge badge-installed">{t.installed}</span>}
+                        <button type="button" className={`btn-icon favorite-btn ${favorites.includes(p.id) ? "is-favorite" : ""}`} onClick={() => onToggleFavorite(p.id)} title={favorites.includes(p.id) ? t.removeFromFav : t.addToFav} aria-label="Favorite">♥</button>
                       </div>
-                      {p.description && <p className="forum-plugin-desc">{p.description}</p>}
-                      {p.rating && (
-                        <span className="forum-plugin-rating">
-                          ★ {p.rating}{p.rating_count ? ` (${p.rating_count})` : ""}
-                        </span>
-                      )}
                     </div>
-                    <div className="forum-plugin-actions">
-                      {!readOnly && (
-                        <button type="button" className="btn btn-primary btn-sm" onClick={() => openDownloadModal(p)} title="Choose download variant">
-                          {t.install}
-                        </button>
-                      )}
-                      <button type="button" className="btn btn-ghost btn-sm forum-plugin-open" onClick={() => onOpenPluginUrl(p.url)}>
-                        {t.viewOnForum}
-                      </button>
+                    {p.description && <p className="resource-card-desc">{p.description}</p>}
+                    <div className="resource-card-stats">
+                      {p.downloads != null && <span className="resource-stat">↓ {p.downloads.toLocaleString()}</span>}
+                      {p.rating && <span className="resource-stat resource-rating">★ {p.rating}{p.rating_count ? ` (${p.rating_count})` : ""}</span>}
+                      {p.updated && <span className="resource-stat">Updated {p.updated}</span>}
                     </div>
-                  </div>
+                    <div className="resource-card-actions">
+                      {!readOnly && <button type="button" className="btn btn-primary btn-sm" onClick={() => openDownloadModal(p)}>{t.install}</button>}
+                      <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenPluginUrl(p.url)}>{t.viewOnForum}</button>
+                    </div>
+                  </article>
                 ))
               )}
             </div>
@@ -832,6 +822,9 @@ function DiscoverPage({
   );
 }
 
+/**
+ * Options page: custom paths, auto-backup, read-only, theme, export/import.
+ */
 function OptionsPage({
   customPluginsPath,
   customObsPath,
@@ -854,8 +847,6 @@ function OptionsPage({
   onImportFavorites,
   theme,
   onThemeChange,
-  appUpdateCheck,
-  onCheckAppUpdate,
 }: {
   customPluginsPath: string;
   customObsPath: string;
@@ -878,8 +869,6 @@ function OptionsPage({
   onImportFavorites: () => void;
   theme: "dark" | "light";
   onThemeChange: (v: "dark" | "light") => void;
-  appUpdateCheck?: { status: string; version?: string };
-  onCheckAppUpdate?: () => void;
 }) {
   return (
     <section className="options-page card">
@@ -1008,6 +997,9 @@ function OptionsPage({
   );
 }
 
+/**
+ * Main App: routing (Home/Discover/Options), global state, Tauri IPC.
+ */
 function App() {
   const [page, setPage] = useState<Page>("home");
   const [plugins, setPlugins] = useState<ObsPluginInfo[]>([]);
@@ -1030,6 +1022,7 @@ function App() {
   const [readOnly, setReadOnly] = useState(false);
   const [configPath, setConfigPath] = useState<string | null>(null);
   const [compactMode, setCompactMode] = useState(false);
+  // Theme persisted in localStorage
   const [theme, setTheme] = useState<"dark" | "light">(() => {
     try {
       const s = localStorage.getItem("theme");
@@ -1128,8 +1121,8 @@ function App() {
       }
       setPathErrors(errs);
     };
-    const t = setTimeout(validatePaths, 400);
-    return () => clearTimeout(t);
+    const timeoutId = setTimeout(validatePaths, 400);
+    return () => clearTimeout(timeoutId);
   }, [customPluginsPath, customObsPath]);
 
   const showToast = useCallback((msg: string) => {
@@ -1231,13 +1224,13 @@ function App() {
     }
   }
 
-  async function openPluginsFolder() {
+  const openPluginsFolder = useCallback(async () => {
     try {
       await invoke("open_plugins_folder");
     } catch (e) {
       setError(String(e));
     }
-  }
+  }, []);
 
   async function testForumConnection() {
     try {
@@ -1332,11 +1325,41 @@ function App() {
     }
   }
 
+  const installFromPath = useCallback(async (path: string) => {
+    try {
+      const name = await invoke<string>("install_plugin_from_path", { path });
+      addAction("Installed", name);
+      showToast(`"${name}" installed.`);
+      await loadData();
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [addAction, showToast, loadData]);
+
+  // Listen for drag-drop; cleanup on unmount (handle async listen promise)
+  useEffect(() => {
+    let unsub: (() => void) | undefined;
+    let mounted = true;
+    listen<{ paths?: string[] }>("tauri://drop", (event) => {
+      const paths = event.payload?.paths;
+      if (paths?.length && !readOnly) {
+        paths.forEach((p) => installFromPath(p));
+      }
+    }).then((u) => {
+      unsub = u;
+      if (!mounted) u(); // Unmounted before listen resolved; unsubscribe immediately
+    });
+    return () => {
+      mounted = false;
+      unsub?.();
+    };
+  }, [readOnly, installFromPath]);
+
   async function exportConfig() {
     try {
       const json = await invoke<string>("export_config_json");
       const path = await save({
-        defaultPath: "obs-addon-manager-backup.json",
+        defaultPath: "obs-plugin-manager-backup.json",
         filters: [{ name: "JSON", extensions: ["json"] }],
       });
       if (path) {
@@ -1413,6 +1436,7 @@ function App() {
   const homeSearchRef = useRef<HTMLInputElement>(null);
   const discoverSearchRef = useRef<HTMLInputElement>(null);
 
+  // Global keyboard shortcuts: Esc (clear), Ctrl+R (refresh), Ctrl+F (focus search), etc.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -1442,23 +1466,25 @@ function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [loadData, page]);
+  }, [loadData, page, openPluginsFolder]);
 
   return (
     <main className="app">
       <header className="header">
         <img src={logo} alt="LamaWorlds" className="header-logo" />
         <div className="header-text">
-          <h1>LamaWorlds OBS Addon Manager</h1>
+          <h1>LamaWorlds OBS Plugin Manager</h1>
           <p className="subtitle">{t.subtitle}</p>
         </div>
       </header>
 
-      <nav className="nav-tabs">
+      <nav className="nav-tabs" role="navigation" aria-label="Main navigation">
         <button
           type="button"
           className={`nav-tab ${page === "home" ? "active" : ""}`}
           onClick={() => setPage("home")}
+          aria-current={page === "home" ? "page" : undefined}
+          aria-label="Home - installed plugins"
         >
           {t.home}
         </button>
@@ -1467,6 +1493,8 @@ function App() {
           className={`nav-tab ${page === "discover" ? "active" : ""}`}
           onClick={() => setPage("discover")}
           title={t.shortcuts}
+          aria-current={page === "discover" ? "page" : undefined}
+          aria-label="Discover - forum plugins"
         >
           {t.discover}
         </button>
@@ -1474,6 +1502,8 @@ function App() {
           type="button"
           className={`nav-tab ${page === "options" ? "active" : ""}`}
           onClick={() => setPage("options")}
+          aria-current={page === "options" ? "page" : undefined}
+          aria-label="Options - settings"
         >
           {t.options}
         </button>

@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    tauri_applama_addon_manager_lib::run()
+    tauri_applama_plugin_manager_lib::run()
 }

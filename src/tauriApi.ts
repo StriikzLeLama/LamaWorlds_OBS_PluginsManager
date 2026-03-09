@@ -1,7 +1,9 @@
 /**
- * Safe Tauri API wrapper.
- * Fixes "Cannot read properties of undefined (reading 'invoke')" when
- * running in browser instead of Tauri.
+ * Safe Tauri API wrapper for the OBS Plugin Manager.
+ *
+ * - Wraps invoke to handle missing Tauri runtime (e.g. when running in browser)
+ * - Provides openFolderDialog helper for directory selection
+ * - Throws a clear error when Tauri is not available
  */
 
 declare global {
@@ -10,6 +12,7 @@ declare global {
   }
 }
 
+/** Raw invoke; throws if __TAURI_INTERNALS__ is missing. */
 async function invokeRaw<T>(cmd: string, args?: unknown): Promise<T> {
   const internals = window.__TAURI_INTERNALS__;
   if (!internals?.invoke) {
@@ -20,6 +23,7 @@ async function invokeRaw<T>(cmd: string, args?: unknown): Promise<T> {
   return internals.invoke(cmd, args) as Promise<T>;
 }
 
+/** Invoke a Tauri command; maps common runtime errors to a friendly message. */
 export async function invoke<T>(cmd: string, args?: unknown): Promise<T> {
   try {
     return await invokeRaw<T>(cmd, args);
@@ -34,6 +38,7 @@ export async function invoke<T>(cmd: string, args?: unknown): Promise<T> {
   }
 }
 
+/** Returns true if running inside Tauri (desktop), false in browser. */
 export function isInTauri(): boolean {
   return typeof window !== "undefined" && !!window.__TAURI_INTERNALS__;
 }

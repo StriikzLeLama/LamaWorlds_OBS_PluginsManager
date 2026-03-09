@@ -1,5 +1,5 @@
 {
-  "name": "tauri-applama-addon-manager",
+  "name": "tauri-applama-plugin-manager",
   "private": true,
   "version": "0.1.0",
   "type": "module",

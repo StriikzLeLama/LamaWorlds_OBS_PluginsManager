@@ -1,4 +1,4 @@
-//! LamaWorlds OBS Addon Manager - Backend
+//! LamaWorlds OBS Plugin Manager - Backend
 //!
 //! Handles OBS plugin discovery, installation, uninstallation, and configuration.
 //! All file operations validate paths to prevent traversal attacks.
@@ -29,15 +29,18 @@ fn default_auto_backup() -> bool {
     true
 }
 
+/// Returns the path to the config file (config.json).
 fn config_path() -> Option<PathBuf> {
-    ProjectDirs::from("com", "lamaworlds", "addon-manager")
+    ProjectDirs::from("com", "lamaworlds", "plugin-manager")
         .map(|d| d.config_dir().join("config.json"))
 }
 
+/// Returns the config directory (for cache, logs).
 fn config_dir() -> Option<PathBuf> {
-    ProjectDirs::from("com", "lamaworlds", "addon-manager").map(|d| d.config_dir().to_path_buf())
+    ProjectDirs::from("com", "lamaworlds", "plugin-manager").map(|d| d.config_dir().to_path_buf())
 }
 
+/// Path to the forum cache file for a given category.
 fn forum_cache_path(category: &str) -> PathBuf {
     config_dir()
         .map(|d| d.join(format!("forum_cache_{}.json", category)))
@@ -45,7 +48,7 @@ fn forum_cache_path(category: &str) -> PathBuf {
 }
 
 fn log_file_path() -> Option<PathBuf> {
-    config_dir().map(|d| d.join("addon-manager.log"))
+    config_dir().map(|d| d.join("plugin-manager.log"))
 }
 
 fn load_config() -> AppConfig {
@@ -68,6 +71,7 @@ fn save_config(config: &AppConfig) -> Result<(), String> {
     std::fs::write(&path, json).map_err(|e| e.to_string())
 }
 
+/// An installed OBS plugin (discovered from plugin folders).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObsPluginInfo {
     pub name: String,
@@ -80,6 +84,7 @@ pub struct ObsPluginInfo {
     pub modified_time: Option<i64>,
 }
 
+/// Detected and configured OBS installation paths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObsPaths {
     pub plugins_path: Option<String>,
@@ -89,6 +94,7 @@ pub struct ObsPaths {
     pub custom_obs_install_path: Option<String>,
 }
 
+/// A built-in catalog plugin (hardcoded popular plugins).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogPlugin {
     pub id: String,
@@ -127,6 +133,9 @@ pub struct ForumPlugin {
     /// Icon image URL (relative or full).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon_url: Option<String>,
+    /// Resource prefix: Free, Non-Free, Semi-free, etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
 }
 
 /// One download option (forum file or GitHub release asset).
@@ -240,6 +249,7 @@ fn get_modified_time(path: &Path) -> Option<i64> {
         .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
 }
 
+/// Returns detected and configured OBS paths (plugins, install, AppData).
 #[tauri::command]
 fn get_obs_paths() -> ObsPaths {
     let config = load_config();
@@ -261,16 +271,19 @@ fn get_obs_paths() -> ObsPaths {
     }
 }
 
+/// Returns the current application configuration.
 #[tauri::command]
 fn get_config() -> AppConfig {
     load_config()
 }
 
+/// Saves the application configuration.
 #[tauri::command]
 fn set_config(config: AppConfig) -> Result<(), String> {
     save_config(&config)
 }
 
+/// Validates that a path exists and is a directory. Empty path returns true (no path set).
 #[tauri::command]
 fn validate_path(path: String) -> Result<bool, String> {
     if path.trim().is_empty() {
@@ -427,6 +440,7 @@ fn find_plugins_in_obs_plugins(path: &Path) -> Vec<ObsPluginInfo> {
     plugins
 }
 
+/// Scans configured OBS plugin folders and returns all installed plugins (including disabled .dll.disabled).
 #[tauri::command]
 fn list_obs_plugins() -> Vec<ObsPluginInfo> {
     let mut all_plugins = Vec::new();
@@ -517,7 +531,7 @@ fn backup_plugin_folder(plugin_path: String) -> Result<String, String> {
         return Err("Path must be inside a configured OBS plugin folder.".to_string());
     }
     let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("plugin");
-    let parent = src.parent().ok_or("Chemin invalide")?;
+    let parent = src.parent().ok_or("Invalid path.")?;
     let zip_path = parent.join(format!("{}-backup.zip", name));
     let file = File::create(&zip_path).map_err(|e| e.to_string())?;
     let mut zip_writer = zip::ZipWriter::new(BufWriter::new(file));
@@ -539,6 +553,7 @@ fn backup_plugin_folder(plugin_path: String) -> Result<String, String> {
     Ok(zip_path.to_string_lossy().to_string())
 }
 
+/// Uninstalls a plugin (removes folder or .dll). Creates backup if auto_backup is enabled.
 #[tauri::command]
 fn uninstall_plugin(uninstall_path: String) -> Result<(), String> {
     if load_config().read_only {
@@ -663,6 +678,7 @@ fn check_paths_valid() -> Result<bool, String> {
     target.parent().map_or(Ok(false), |p| Ok(p.exists()))
 }
 
+/// Disables a plugin by renaming .dll to .dll.disabled (or folder to folder.disabled).
 #[tauri::command]
 fn disable_plugin(plugin_path: String) -> Result<(), String> {
     if load_config().read_only {
@@ -687,6 +703,7 @@ fn disable_plugin(plugin_path: String) -> Result<(), String> {
     std::fs::rename(path, &new_path).map_err(|e| e.to_string())
 }
 
+/// Re-enables a disabled plugin by removing the .disabled suffix.
 #[tauri::command]
 fn enable_plugin(plugin_path: String) -> Result<(), String> {
     if load_config().read_only {
@@ -709,6 +726,7 @@ fn enable_plugin(plugin_path: String) -> Result<(), String> {
     std::fs::rename(path, &new_path).map_err(|e| e.to_string())
 }
 
+/// Downloads a plugin ZIP from URL and extracts it to the OBS plugins folder.
 #[tauri::command]
 fn install_plugin_from_url(url: String) -> Result<String, String> {
     if load_config().read_only {
@@ -744,7 +762,7 @@ fn install_plugin_from_url(url: String) -> Result<String, String> {
         }
 
         let path = Path::new(&name);
-        // Reject path traversal (Zip Slip): absolute paths and ".." escape target
+        // Security: reject path traversal (Zip Slip) - skip absolute paths and ".."
         if path.is_absolute()
             || path.components().any(|c| matches!(c, std::path::Component::ParentDir))
         {
@@ -768,9 +786,105 @@ fn install_plugin_from_url(url: String) -> Result<String, String> {
         }
     }
 
-    let name = installed_name.ok_or_else(|| "Archive ZIP invalide (structure non reconnue).".to_string())?;
+    let name = installed_name
+        .ok_or_else(|| "Invalid ZIP archive (structure not recognized).".to_string())?;
     log_action(&format!("Installed from URL: {} -> {}", url, name));
     Ok(name)
+}
+
+/// Installs a plugin from a local file path (.zip, .dll) or folder.
+#[tauri::command]
+fn install_plugin_from_path(path: String) -> Result<String, String> {
+    if load_config().read_only {
+        return Err("Read-only mode: install disabled.".to_string());
+    }
+    let target_dir = get_target_plugins_dir()?;
+    let src = Path::new(&path);
+    if !src.exists() {
+        return Err(format!("File not found: {}", path));
+    }
+
+    if src.is_file() {
+        let ext = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if ext == "zip" {
+            let file = File::open(src).map_err(|e| e.to_string())?;
+            let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid ZIP: {}", e))?;
+            let mut installed_name: Option<String> = None;
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+                let name = file.name().to_string();
+                if name.ends_with('/') {
+                    continue;
+                }
+                let p = Path::new(&name);
+                // Security: reject path traversal (Zip Slip)
+                if p.is_absolute()
+                    || p.components().any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    continue;
+                }
+                let parts: Vec<&str> = p.components().map(|c| c.as_os_str().to_str().unwrap_or("")).collect();
+                let root = parts.first().filter(|s| !s.is_empty()).map_or("", |s| *s);
+                if installed_name.is_none() && !root.is_empty() {
+                    installed_name = Some(root.to_string());
+                }
+                let out_path = target_dir.join(p);
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                if file.is_file() {
+                    let mut out_file = File::create(&out_path).map_err(|e| e.to_string())?;
+                    std::io::copy(&mut file, &mut out_file).map_err(|e| e.to_string())?;
+                }
+            }
+            let name = installed_name.ok_or_else(|| "Invalid ZIP structure.".to_string())?;
+            log_action(&format!("Installed from file: {} -> {}", path, name));
+            return Ok(name);
+        }
+        if ext == "dll" {
+            let dest = target_dir.join("64bit").join(src.file_name().unwrap_or(std::ffi::OsStr::new("plugin.dll")));
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::copy(src, &dest).map_err(|e| e.to_string())?;
+            let name = src.file_stem().and_then(|s| s.to_str()).unwrap_or("plugin").to_string();
+            log_action(&format!("Installed DLL from file: {} -> {}", path, name));
+            return Ok(name);
+        }
+        return Err("Unsupported file type. Use .zip or .dll".to_string());
+    }
+
+    if src.is_dir() {
+        let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("plugin").to_string();
+        let dest = target_dir.join(&name);
+        if dest.exists() {
+            std::fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
+        }
+        copy_dir_all(src, &dest)?;
+        log_action(&format!("Installed folder from: {} -> {}", path, name));
+        return Ok(name);
+    }
+
+    Err("Unsupported path.".to_string())
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let ty = entry.file_type().map_err(|e| e.to_string())?;
+        let dst_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dst_path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 const OBS_FORUM_PLUGINS_URL: &str = "https://obsproject.com/forum/plugins/";
@@ -858,15 +972,19 @@ fn fetch_forum_resources_page(
 
     let doc = Html::parse_document(&body);
     let item_sel = Selector::parse("div.structItem.structItem--resource").map_err(|e| e.to_string())?;
-    let title_sel = Selector::parse("div.structItem-title a[href*='/forum/resources/']").unwrap();
-    let version_sel = Selector::parse("div.structItem-title span.u-muted").unwrap();
-    let author_sel = Selector::parse("a.username").unwrap();
-    let desc_sel = Selector::parse("div.structItem-resourceTagLine").unwrap();
-    let rating_sel = Selector::parse("span.ratingStars").unwrap();
-    let rating_text_sel = Selector::parse("span.ratingStarsRow-text").unwrap();
-    let downloads_sel = Selector::parse("dl.structItem-metaItem--downloads dd").unwrap();
-    let updated_sel = Selector::parse("dl.structItem-metaItem--lastUpdate dd").unwrap();
-    let icon_sel = Selector::parse("div.structItem-iconContainer img[src*='resource_icons']").unwrap();
+    // These selectors target the OBS forum HTML structure; parse errors indicate selector bugs
+    let title_sel = Selector::parse("div.structItem-title a[href*='/forum/resources/']")
+        .expect("valid forum title selector");
+    let version_sel = Selector::parse("div.structItem-title span.u-muted").expect("valid version selector");
+    let author_sel = Selector::parse("a.username").expect("valid author selector");
+    let desc_sel = Selector::parse("div.structItem-resourceTagLine").expect("valid desc selector");
+    let rating_sel = Selector::parse("span.ratingStars").expect("valid rating selector");
+    let rating_text_sel = Selector::parse("span.ratingStarsRow-text").expect("valid rating text selector");
+    let downloads_sel = Selector::parse("dl.structItem-metaItem--downloads dd").expect("valid downloads selector");
+    let updated_sel = Selector::parse("dl.structItem-metaItem--lastUpdate dd").expect("valid updated selector");
+    let icon_sel =
+        Selector::parse("div.structItem-iconContainer img[src*='resource_icons']").expect("valid icon selector");
+    let prefix_sel = Selector::parse("span.label--prefix, a.tagItem--prefix").expect("valid prefix selector");
 
     let mut list = Vec::new();
     for item in doc.select(&item_sel) {
@@ -950,6 +1068,12 @@ fn fetch_forum_resources_page(
                 }
             });
 
+        let prefix = item
+            .select(&prefix_sel)
+            .next()
+            .map(|e| e.text().collect::<Vec<_>>().join("").trim().to_string())
+            .filter(|s| !s.is_empty());
+
         list.push(ForumPlugin {
             id: id.clone(),
             title,
@@ -964,6 +1088,7 @@ fn fetch_forum_resources_page(
             downloads,
             updated,
             icon_url,
+            prefix,
         });
     }
     Ok(list)
@@ -991,7 +1116,7 @@ fn fetch_forum_plugins_impl(
     }
 
     let client = reqwest::blocking::Client::builder()
-        .user_agent("LamaWorlds-OBS-AddonManager/1.0 (Desktop; OBS Plugin Manager)")
+        .user_agent("LamaWorlds-OBS-PluginManager/1.0 (Desktop; OBS Plugin Manager)")
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -1028,7 +1153,7 @@ fn search_forum_resources(keywords: String) -> Result<Vec<ForumPlugin>, String> 
         return Ok(Vec::new());
     }
     let client = reqwest::blocking::Client::builder()
-        .user_agent("LamaWorlds-OBS-AddonManager/1.0 (Desktop; OBS Plugin Manager)")
+        .user_agent("LamaWorlds-OBS-PluginManager/1.0 (Desktop; OBS Plugin Manager)")
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -1113,24 +1238,25 @@ fn check_plugin_updates() -> Result<Vec<PluginUpdateInfo>, String> {
     Ok(updates)
 }
 
+/// Fetches available download options for a forum resource (forum files + GitHub releases).
 #[tauri::command]
 fn fetch_plugin_download_options(resource_url: String) -> Result<Vec<DownloadOption>, String> {
     let client = reqwest::blocking::Client::builder()
-        .user_agent("LamaWorlds-OBS-AddonManager/1.0 (Desktop; OBS Plugin Manager)")
+        .user_agent("LamaWorlds-OBS-PluginManager/1.0 (Desktop; OBS Plugin Manager)")
         .build()
         .map_err(|e| e.to_string())?;
 
     let mut options = Vec::new();
 
-    // 1. Fetch forum download page for file list
+    // Step 1: Fetch forum download page to list available file attachments
     let download_page = resource_url.trim_end_matches('/').to_string() + "/download";
     if let Ok(resp) = client.get(&download_page).send() {
         if let Ok(body) = resp.text() {
             let doc = Html::parse_document(&body);
-            let row_sel = Selector::parse("li.block-row").unwrap();
-            let link_sel = Selector::parse("a[href*='/download?file=']").unwrap();
-            let title_sel = Selector::parse("h3.contentRow-title").unwrap();
-            let minor_sel = Selector::parse("div.contentRow-minor").unwrap();
+            let row_sel = Selector::parse("li.block-row").expect("valid row selector");
+            let link_sel = Selector::parse("a[href*='/download?file=']").expect("valid link selector");
+            let title_sel = Selector::parse("h3.contentRow-title").expect("valid title selector");
+            let minor_sel = Selector::parse("div.contentRow-minor").expect("valid minor selector");
             for row in doc.select(&row_sel) {
                 if let Some(link) = row.select(&link_sel).next() {
                     let href = link.value().attr("href").unwrap_or("");
@@ -1160,14 +1286,16 @@ fn fetch_plugin_download_options(resource_url: String) -> Result<Vec<DownloadOpt
         }
     }
 
-    // 2. Fetch resource page for GitHub source URL
+    // Step 2: Fetch resource page to find GitHub repository URL
     let resource_page = resource_url.trim_end_matches('/').to_string();
     let mut github_url: Option<String> = None;
     if let Ok(resp) = client.get(&resource_page).send() {
         if let Ok(body) = resp.text() {
             let doc = Html::parse_document(&body);
-            for dd in doc.select(&Selector::parse("dd").unwrap()) {
-                if let Some(a) = dd.select(&Selector::parse("a[href*='github.com']").unwrap()).next() {
+            let dd_sel = Selector::parse("dd").expect("valid dd selector");
+            let gh_sel = Selector::parse("a[href*='github.com']").expect("valid github link selector");
+            for dd in doc.select(&dd_sel) {
+                if let Some(a) = dd.select(&gh_sel).next() {
                     if let Some(href) = a.value().attr("href") {
                         github_url = Some(href.to_string());
                         break;
@@ -1177,7 +1305,7 @@ fn fetch_plugin_download_options(resource_url: String) -> Result<Vec<DownloadOpt
         }
     }
 
-    // 3. Fetch GitHub releases if we have a repo URL
+    // Step 3: Fetch GitHub releases API for .zip/.exe assets
     if let Some(gh) = github_url {
         if let Some((owner, repo)) = parse_github_repo(&gh) {
             let api_url = format!(
@@ -1342,6 +1470,7 @@ pub fn run() {
             disable_plugin,
             enable_plugin,
             install_plugin_from_url,
+            install_plugin_from_path,
             get_plugin_catalog,
             fetch_forum_plugins,
             search_forum_resources,

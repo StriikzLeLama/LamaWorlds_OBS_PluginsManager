@@ -4141,7 +4141,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tauri-applama-addon-manager"
+name = "tauri-applama-plugin-manager"
 version = "0.1.0"
 dependencies = [
  "chrono",

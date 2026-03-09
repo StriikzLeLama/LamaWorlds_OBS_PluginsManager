@@ -1,4 +1,4 @@
-# LamaWorlds OBS Addon Manager
+# LamaWorlds OBS Plugin Manager
 
 Tauri + React application for managing OBS Studio plugins.
 
