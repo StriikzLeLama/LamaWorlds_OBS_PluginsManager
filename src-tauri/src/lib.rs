@@ -173,7 +173,7 @@ fn load_forum_cache(category: &str) -> Option<Vec<ForumPlugin>> {
 /// Save forum plugin list to cache (TTL 20 min).
 fn save_forum_cache(category: &str, plugins: &[ForumPlugin]) {
     let path = forum_cache_path(category);
-        if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let cache = ForumCache {
@@ -200,6 +200,89 @@ fn log_action(message: &str) {
             let _ = f.write_all(line.as_bytes());
         }
     }
+}
+
+fn format_io_error(e: std::io::Error, context: &str) -> String {
+    #[cfg(windows)]
+    if e.raw_os_error() == Some(5) {
+        return format!(
+            "{context}: Access denied (OS error 5). Close OBS Studio completely, then retry. \
+             If the plugin lives under Program Files, set a custom plugins folder in Options \
+             or run the app as administrator."
+        );
+    }
+    format!("{context}: {e}")
+}
+
+fn ensure_obs_not_running() -> Result<(), String> {
+    if is_obs_running() {
+        return Err(
+            "OBS Studio is running. Close OBS completely before installing, updating, or removing plugins."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn can_write_to_dir(dir: Option<&Path>) -> bool {
+    let dir = match dir {
+        Some(d) if d.exists() => d,
+        _ => return false,
+    };
+    let test = dir.join(".lamaworlds_write_test");
+    match std::fs::write(&test, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&test);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Parent directory where a plugin package should be extracted (plugins/ or obs-plugins/).
+fn find_plugins_dir_for_name(plugin_name: &str) -> Option<PathBuf> {
+    for p in list_obs_plugins() {
+        if !p.name.eq_ignore_ascii_case(plugin_name) {
+            continue;
+        }
+        let path = Path::new(&p.uninstall_path);
+        if path.is_dir() {
+            return path.parent().map(|parent| parent.to_path_buf());
+        }
+        if let Some(parent) = path.parent() {
+            if parent.file_name().and_then(|n| n.to_str()) == Some("64bit") {
+                if let Some(obs_plugins) = parent.parent() {
+                    return Some(obs_plugins.to_path_buf());
+                }
+            }
+            return Some(parent.to_path_buf());
+        }
+    }
+    None
+}
+
+/// Removes every on-disk install matching `plugin_name`. Returns true if something was removed.
+fn remove_installed_plugin_by_name(plugin_name: &str) -> Result<bool, String> {
+    let mut was_update = false;
+    for p in list_obs_plugins() {
+        if !p.name.eq_ignore_ascii_case(plugin_name) {
+            continue;
+        }
+        let path = Path::new(&p.uninstall_path);
+        if !path.exists() {
+            continue;
+        }
+        was_update = true;
+        if load_config().auto_backup && path.is_dir() && can_write_to_dir(path.parent()) {
+            let _ = backup_plugin_folder(p.uninstall_path.clone());
+        }
+        if path.is_dir() {
+            remove_dir_all_recursive(path)?;
+        } else {
+            std::fs::remove_file(path).map_err(|e| format_io_error(e, "remove plugin file"))?;
+        }
+    }
+    Ok(was_update)
 }
 
 fn get_program_data_path() -> PathBuf {
@@ -447,12 +530,16 @@ fn list_obs_plugins() -> Vec<ObsPluginInfo> {
     let mut seen_names = std::collections::HashSet::new();
     let paths = get_obs_paths();
 
+    // Clone the OBS install paths so they can be used both for data/plugins and obs-plugins
+    let custom_obs = paths.custom_obs_install_path.clone();
+    let obs_install = paths.obs_install_path.clone();
+
     let mut plugin_paths: Vec<Option<String>> = vec![
         paths.custom_plugins_path,
         paths.plugins_path,
         paths.appdata_plugins,
     ];
-    for obs in [paths.custom_obs_install_path.as_deref(), paths.obs_install_path.as_deref()].into_iter().flatten() {
+    for obs in [custom_obs.as_deref(), obs_install.as_deref()].into_iter().flatten() {
         plugin_paths.push(Some(Path::new(obs).join("data").join("plugins").to_string_lossy().to_string()));
     }
 
@@ -468,8 +555,8 @@ fn list_obs_plugins() -> Vec<ObsPluginInfo> {
     }
 
     let obs_paths: Vec<Option<String>> = vec![
-        paths.custom_obs_install_path,
-        paths.obs_install_path,
+        custom_obs,
+        obs_install,
     ];
     for obs_path_opt in obs_paths {
         if let Some(obs_path) = obs_path_opt {
@@ -488,15 +575,12 @@ fn list_obs_plugins() -> Vec<ObsPluginInfo> {
 
 fn remove_dir_all_recursive(p: &Path) -> Result<(), String> {
     if p.is_dir() {
-        for entry in std::fs::read_dir(p).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            remove_dir_all_recursive(&entry.path())?;
-        }
-        std::fs::remove_dir(p).map_err(|e| e.to_string())?;
+        std::fs::remove_dir_all(p).map_err(|e| format_io_error(e, "remove plugin folder"))
+    } else if p.exists() {
+        std::fs::remove_file(p).map_err(|e| format_io_error(e, "remove plugin file"))
     } else {
-        std::fs::remove_file(p).map_err(|e| e.to_string())?;
+        Ok(())
     }
-    Ok(())
 }
 
 #[tauri::command]
@@ -504,13 +588,12 @@ fn is_obs_running() -> bool {
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
-        let output = Command::new("tasklist")
-            .output()
-            .map_err(|_| ())
-            .ok();
+        let output = Command::new("tasklist").output().ok();
         if let Some(ok) = output {
-            let stdout = String::from_utf8_lossy(&ok.stdout);
-            stdout.to_lowercase().contains("obs64.exe")
+            let stdout = String::from_utf8_lossy(&ok.stdout).to_lowercase();
+            ["obs64.exe", "obs32.exe", "obs.exe"]
+                .iter()
+                .any(|proc| stdout.contains(proc))
         } else {
             false
         }
@@ -535,7 +618,7 @@ fn backup_plugin_folder(plugin_path: String) -> Result<String, String> {
     let zip_path = parent.join(format!("{}-backup.zip", name));
     let file = File::create(&zip_path).map_err(|e| e.to_string())?;
     let mut zip_writer = zip::ZipWriter::new(BufWriter::new(file));
-    let options: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+    let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Stored);
     for entry in WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -565,7 +648,7 @@ fn backup_all_plugins() -> Result<String, String> {
     let zip_path = parent.join(format!("obs-plugins-backup-{}.zip", ts));
     let file = File::create(&zip_path).map_err(|e| e.to_string())?;
     let mut zip_writer = zip::ZipWriter::new(BufWriter::new(file));
-    let options: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+    let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Stored);
     for entry in WalkDir::new(&plugins_dir).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -592,6 +675,7 @@ fn uninstall_plugin(uninstall_path: String) -> Result<(), String> {
     if load_config().read_only {
         return Err("Read-only mode: uninstall disabled.".to_string());
     }
+    ensure_obs_not_running()?;
     let path = Path::new(&uninstall_path);
     if !path.exists() {
         return Err(format!("File or folder does not exist: {}", uninstall_path));
@@ -693,6 +777,13 @@ fn open_log_folder() -> Result<(), String> {
 #[tauri::command]
 fn read_log_file() -> Result<String, String> {
     let path = log_file_path().ok_or("Log file path not found")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if !path.exists() {
+        std::fs::write(&path, "").map_err(|e| e.to_string())?;
+        return Ok(String::new());
+    }
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
@@ -785,8 +876,7 @@ fn enable_plugin(plugin_path: String) -> Result<(), String> {
 fn extract_zip_to_obs(
     mut archive: zip::ZipArchive<std::io::Cursor<Vec<u8>>>,
 ) -> Result<(String, bool), String> {
-    let target_dir = get_target_plugins_dir()?;
-    let data_dir_opt = target_dir.parent().map(|p| p.join("data"));
+    ensure_obs_not_running()?;
 
     let mut roots: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut plugin_subdirs: Vec<String> = Vec::new();
@@ -834,6 +924,15 @@ fn extract_zip_to_obs(
         .clone()
         .unwrap_or_else(|| "plugin".to_string());
 
+    let target_dir = match find_plugins_dir_for_name(&name) {
+        Some(dir) => dir,
+        None => get_target_plugins_dir()?,
+    };
+    let data_dir_opt = target_dir.parent().map(|p| p.join("data"));
+
+    let mut was_update = remove_installed_plugin_by_name(&name)?;
+
+    // Also remove package folder names from the zip when they differ from the plugin id.
     let to_remove: Vec<String> = if has_obs_plugins {
         plugin_subdirs
     } else if name != "bin" {
@@ -842,18 +941,17 @@ fn extract_zip_to_obs(
         Vec::new()
     };
 
-    let mut was_update = false;
     for plugin_name in &to_remove {
         let dest_plugin = target_dir.join(plugin_name);
         if dest_plugin.exists() {
             was_update = true;
-            if load_config().auto_backup && dest_plugin.is_dir() {
+            if load_config().auto_backup && dest_plugin.is_dir() && can_write_to_dir(dest_plugin.parent()) {
                 let _ = backup_plugin_folder(dest_plugin.to_string_lossy().to_string());
             }
             if dest_plugin.is_dir() {
                 remove_dir_all_recursive(&dest_plugin)?;
             } else {
-                let _ = std::fs::remove_file(&dest_plugin);
+                std::fs::remove_file(&dest_plugin).map_err(|e| format_io_error(e, "remove old plugin"))?;
             }
         }
     }
@@ -884,11 +982,12 @@ fn extract_zip_to_obs(
             continue;
         };
         if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(parent).map_err(|e| format_io_error(e, "create plugin folder"))?;
         }
         if file.is_file() {
-            let mut out_file = File::create(&out_path).map_err(|e| e.to_string())?;
-            std::io::copy(&mut file, &mut out_file).map_err(|e| e.to_string())?;
+            let mut out_file =
+                File::create(&out_path).map_err(|e| format_io_error(e, "write plugin file"))?;
+            std::io::copy(&mut file, &mut out_file).map_err(|e| format_io_error(e, "extract plugin file"))?;
         }
     }
 
@@ -897,31 +996,46 @@ fn extract_zip_to_obs(
 
 /// Downloads a plugin ZIP from URL and extracts it to the OBS plugins folder.
 #[tauri::command]
-fn install_plugin_from_url(url: String) -> Result<String, String> {
+fn install_plugin_from_url(url: String) -> Result<InstallFromPathResult, String> {
     if load_config().read_only {
         return Err("Read-only mode: install disabled.".to_string());
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .build()
-        .map_err(|e| e.to_string())?;
+    let result = (|| -> Result<InstallFromPathResult, String> {
+        let client = reqwest::blocking::Client::builder()
+            .build()
+            .map_err(|e| e.to_string())?;
 
-    let response = client
-        .get(&url)
-        .send()
-        .map_err(|e| format!("Download error: {}", e))?;
+        let response = client
+            .get(&url)
+            .send()
+            .map_err(|e| format!("Download error: {}", e))?;
 
-    if !response.status().is_success() {
-        return Err(format!("Download failed (code {})", response.status()));
+        if !response.status().is_success() {
+            return Err(format!("Download failed (code {})", response.status()));
+        }
+
+        let bytes = response.bytes().map_err(|e| e.to_string())?.to_vec();
+        let cursor = std::io::Cursor::new(bytes);
+        let archive = zip::ZipArchive::new(cursor).map_err(|e| format!("Invalid ZIP: {}", e))?;
+
+        let (name, was_update) = extract_zip_to_obs(archive)?;
+        log_action(&format!(
+            "{} from URL: {} -> {}",
+            if was_update { "Updated" } else { "Installed" },
+            url,
+            name
+        ));
+        Ok(InstallFromPathResult {
+            name,
+            updated: was_update,
+        })
+    })();
+
+    if let Err(ref err) = result {
+        log_action(&format!("ERROR install from URL: {} -> {}", url, err));
     }
-
-    let bytes = response.bytes().map_err(|e| e.to_string())?.to_vec();
-    let cursor = std::io::Cursor::new(bytes);
-    let archive = zip::ZipArchive::new(cursor).map_err(|e| format!("Invalid ZIP: {}", e))?;
-
-    let (name, _) = extract_zip_to_obs(archive)?;
-    log_action(&format!("Installed from URL: {} -> {}", url, name));
-    Ok(name)
+    result
 }
 
 /// Result of install/update from file.
@@ -1584,6 +1698,7 @@ fn open_plugins_folder(folder_override: Option<String>) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    log_action("Plugin Manager started");
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())

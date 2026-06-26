@@ -136,6 +136,8 @@ function HomePage({
   onCompactModeChange,
   toast,
   pluginUpdates,
+  onUpdatePlugin,
+  updatingPlugins,
 }: {
   plugins: ObsPluginInfo[];
   paths: ObsPaths | null;
@@ -172,6 +174,8 @@ function HomePage({
   onCompactModeChange: (v: boolean) => void;
   toast: string | null;
   pluginUpdates?: PluginUpdateInfo[];
+  onUpdatePlugin?: (update: PluginUpdateInfo) => void;
+  updatingPlugins?: Set<string>;
 }) {
   const [installUrl, setInstallUrl] = useState("");
   const [installLoading, setInstallLoading] = useState(false);
@@ -283,6 +287,17 @@ function HomePage({
           }}
           onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add("drop-zone-active"); }}
           onDragLeave={(e) => { e.preventDefault(); e.currentTarget.classList.remove("drop-zone-active"); }}
+          onDrop={(e) => {
+            e.preventDefault();
+            e.currentTarget.classList.remove("drop-zone-active");
+            if (readOnly || importLoading) return;
+            const files = Array.from(e.dataTransfer.files);
+            files.forEach((f) => {
+              if (f.name.endsWith(".zip") || f.name.endsWith(".dll")) {
+                onInstallFromPastePath((f as File & { path?: string }).path ?? f.name);
+              }
+            });
+          }}
           title={t.dropZoneHint}
         >
           <span className="drop-zone-icon">📦</span>
@@ -440,6 +455,9 @@ function HomePage({
                   menu.className = "context-menu";
                   menu.style.cssText = `left:${e.clientX}px;top:${e.clientY}px`;
                   const items: { label: string; onClick: () => void }[] = [];
+                  if (updateInfo && onUpdatePlugin && !readOnly) {
+                    items.unshift({ label: t.updatePlugin, onClick: () => onUpdatePlugin(updateInfo) });
+                  }
                   if (updateInfo && onOpenPluginUrl) items.push({ label: t.viewOnForum, onClick: () => onOpenPluginUrl(updateInfo.forum_url) });
                   if (onOpenPluginFolder) items.push({ label: t.openInFolder, onClick: () => onOpenPluginFolder(plugin.path) });
                   if (!readOnly) {
@@ -478,6 +496,17 @@ function HomePage({
                   )}
                 </div>
                 <div className="plugin-btns">
+                  {updateInfo && onUpdatePlugin && (
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      onClick={() => onUpdatePlugin(updateInfo)}
+                      disabled={readOnly || updatingPlugins?.has(plugin.name)}
+                      title={t.updatePlugin}
+                    >
+                      {updatingPlugins?.has(plugin.name) ? t.installing : t.updatePlugin}
+                    </button>
+                  )}
                   {plugin.enabled ? (
                     <button
                       type="button"
@@ -1199,16 +1228,23 @@ function LogsPage({
 }) {
   const [backendLog, setBackendLog] = useState<string | null>(null);
   const [backendLogError, setBackendLogError] = useState<string | null>(null);
+  const [backendLogLoading, setBackendLogLoading] = useState(true);
+  const [logDir, setLogDir] = useState<string | null>(null);
 
   const loadBackendLog = useCallback(() => {
+    setBackendLogLoading(true);
     setBackendLogError(null);
     invoke<string>("read_log_file")
       .then(setBackendLog)
-      .catch((e) => setBackendLogError(String(e)));
+      .catch((e) => setBackendLogError(String(e)))
+      .finally(() => setBackendLogLoading(false));
   }, []);
 
   useEffect(() => {
     loadBackendLog();
+    invoke<string | null>("get_config_dir")
+      .then((dir) => setLogDir(dir ?? null))
+      .catch(() => setLogDir(null));
   }, [loadBackendLog, actionLog]);
 
   return (
@@ -1255,11 +1291,23 @@ function LogsPage({
           </div>
         </div>
         {backendLogError && (
-          <p className="empty-hint">{backendLogError}</p>
+          <p className="alert alert-error">{backendLogError}</p>
         )}
-        {backendLog && (
+        {logDir && (
+          <p className="empty-hint config-path">
+            {t.logPath}: <code>{logDir}</code>
+          </p>
+        )}
+        {backendLogLoading ? (
+          <div className="loading-state">
+            <div className="spinner" />
+            <span>{t.loading}</span>
+          </div>
+        ) : !backendLogError && backendLog?.trim() ? (
           <pre className="logs-backend-content">{backendLog}</pre>
-        )}
+        ) : !backendLogError ? (
+          <p className="empty-hint">{t.logEmpty}</p>
+        ) : null}
       </div>
     </section>
   );
@@ -1301,6 +1349,7 @@ function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [lang, setLangState] = useState<Lang>(getLang);
   const [pluginUpdates, setPluginUpdates] = useState<PluginUpdateInfo[]>([]);
+  const [updatingPlugins, setUpdatingPlugins] = useState<Set<string>>(new Set());
   const IMPORT_HISTORY_KEY = "obs-plugin-manager-import-history";
   const MAX_IMPORT_HISTORY = 5;
   const [importHistory, setImportHistory] = useState<string[]>(() => {
@@ -1537,7 +1586,7 @@ function App() {
 
   const openPluginFolder = useCallback(async (path: string) => {
     try {
-      await invoke("open_plugins_folder", { folder_override: path });
+      await invoke("open_plugins_folder", { folderOverride: path });
     } catch (e) {
       setError(String(e));
     }
@@ -1627,14 +1676,60 @@ function App() {
 
   async function installFromUrl(url: string) {
     try {
-      const name = await invoke<string>("install_plugin_from_url", { url });
-      addAction("Installed", name, "from URL");
-      showToast(t.installedPlugin(name));
+      const res = await invoke<{ name: string; updated: boolean }>("install_plugin_from_url", { url });
+      addAction(res.updated ? "Updated" : "Installed", res.name, "from URL");
+      showToast(res.updated ? t.updatedPlugin(res.name) : t.installedPlugin(res.name));
       await loadData();
+      await checkPluginUpdates();
     } catch (e) {
       setError(String(e));
     }
   }
+
+  const updatePluginFromForum = useCallback(async (update: PluginUpdateInfo) => {
+    if (readOnly) return;
+    try {
+      const running = await invoke<boolean>("is_obs_running");
+      if (running) {
+        setObsRunning(true);
+        setError(t.obsRunning);
+        return;
+      }
+    } catch {
+      if (obsRunning) {
+        setError(t.obsRunning);
+        return;
+      }
+    }
+    setUpdatingPlugins((prev) => new Set(prev).add(update.plugin_name));
+    try {
+      const opts = await invoke<DownloadOption[]>("fetch_plugin_download_options", {
+        resourceUrl: update.forum_url,
+      });
+      const pick =
+        opts.find((o) => /\.zip(\?|$)/i.test(o.url) || o.label.toLowerCase().includes(".zip")) ??
+        opts[0];
+      if (!pick) {
+        setError(`No download found for "${update.plugin_name}"`);
+        return;
+      }
+      const res = await invoke<{ name: string; updated: boolean }>("install_plugin_from_url", {
+        url: pick.url,
+      });
+      addAction(res.updated ? "Updated" : "Installed", res.name, update.forum_url);
+      showToast(res.updated ? t.updatedPlugin(res.name) : t.installedPlugin(res.name));
+      await loadData();
+      await checkPluginUpdates();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setUpdatingPlugins((prev) => {
+        const next = new Set(prev);
+        next.delete(update.plugin_name);
+        return next;
+      });
+    }
+  }, [readOnly, obsRunning, addAction, showToast, loadData, checkPluginUpdates]);
 
   const installFromPath = useCallback(async (path: string) => {
     try {
@@ -1708,7 +1803,7 @@ function App() {
   useEffect(() => {
     let unsub: (() => void) | undefined;
     let mounted = true;
-    listen<{ paths?: string[] }>("tauri://drop", (event) => {
+    listen<{ paths?: string[] }>("tauri://drag-drop", (event) => {
       const paths = event.payload?.paths;
       if (paths?.length && !readOnly) {
         paths.forEach((p) => installFromPath(p));
@@ -1990,6 +2085,14 @@ function App() {
             <span key={u.plugin_name} className="plugin-update-item">
               <span>{u.plugin_name}</span>
               {u.installed_version && <span className="version-diff">v{u.installed_version} → v{u.available_version ?? "?"}</span>}
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                onClick={() => updatePluginFromForum(u)}
+                disabled={readOnly || updatingPlugins.has(u.plugin_name)}
+              >
+                {updatingPlugins.has(u.plugin_name) ? t.installing : t.updatePlugin}
+              </button>
               <button type="button" className="btn btn-sm btn-outline" onClick={() => openPluginUrl(u.forum_url)}>
                 {t.viewOnForum}
               </button>
@@ -2044,6 +2147,8 @@ function App() {
             onCompactModeChange={setCompactMode}
             toast={toast}
             pluginUpdates={pluginUpdates}
+            onUpdatePlugin={updatePluginFromForum}
+            updatingPlugins={updatingPlugins}
           />
         )}
         {page === "discover" && (
