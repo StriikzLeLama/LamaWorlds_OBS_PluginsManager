@@ -100,6 +100,9 @@ function formatDate(ts: number | null | undefined): string {
  * Home page: lists installed OBS plugins with search, sort, filter.
  * Shows paths, plugin actions (disable/enable/uninstall), and action history.
  */
+// ─────────────────────────────────────────────────────────────────────────
+// Home Page
+// ─────────────────────────────────────────────────────────────────────────
 function HomePage({
   plugins,
   paths,
@@ -180,817 +183,441 @@ function HomePage({
   const [installUrl, setInstallUrl] = useState("");
   const [installLoading, setInstallLoading] = useState(false);
   const [pastePath, setPastePath] = useState("");
+  const [installPanelOpen, setInstallPanelOpen] = useState(false);
+  const [expandedPlugin, setExpandedPlugin] = useState<string | null>(null);
 
   const handleInstallFromUrl = useCallback(async () => {
     if (!installUrl.trim()) return;
     setInstallLoading(true);
-    try {
-      await onInstallFromUrl(installUrl.trim());
-      setInstallUrl("");
-    } finally {
-      setInstallLoading(false);
-    }
+    try { await onInstallFromUrl(installUrl.trim()); setInstallUrl(""); }
+    finally { setInstallLoading(false); }
   }, [installUrl, onInstallFromUrl]);
 
-  const hasPaths =
-    paths &&
-    (paths.custom_plugins_path ||
-      paths.plugins_path ||
-      paths.obs_install_path ||
-      paths.appdata_plugins ||
-      paths.custom_obs_install_path);
-
-  // Filter by status (all/active/disabled), search query, then sort
   const filteredPlugins = useMemo(() => {
     let list = [...plugins];
-    if (statusFilter === "active") list = list.filter((p) => p.enabled);
-    else if (statusFilter === "disabled") list = list.filter((p) => !p.enabled);
+    if (statusFilter === "active")   list = list.filter(p => p.enabled);
+    if (statusFilter === "disabled") list = list.filter(p => !p.enabled);
     if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase().trim();
-      list = list.filter(
-        (p) =>
-          p.name.toLowerCase().includes(q) || p.path.toLowerCase().includes(q)
-      );
+      const q = searchQuery.toLowerCase();
+      list = list.filter(p => p.name.toLowerCase().includes(q) || p.path.toLowerCase().includes(q));
     }
-    if (sortBy === "name")
-      list.sort((a, b) =>
-        a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
-      );
-    else if (sortBy === "path")
-      list.sort((a, b) => a.path.localeCompare(b.path));
-    else if (sortBy === "date")
-      list.sort((a, b) => (b.modified_time ?? 0) - (a.modified_time ?? 0));
+    if (sortBy === "name") list.sort((a,b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+    else if (sortBy === "path") list.sort((a,b) => a.path.localeCompare(b.path));
+    else list.sort((a,b) => (b.modified_time ?? 0) - (a.modified_time ?? 0));
     return list;
   }, [plugins, searchQuery, sortBy, statusFilter]);
 
+  const activeCount   = plugins.filter(p => p.enabled).length;
+  const disabledCount = plugins.filter(p => !p.enabled).length;
+  const updateCount   = pluginUpdates?.length ?? 0;
+
+  const hasPaths = paths && (
+    paths.custom_plugins_path || paths.plugins_path ||
+    paths.obs_install_path || paths.appdata_plugins || paths.custom_obs_install_path
+  );
+
   return (
-    <>
+    <div className="home-layout">
       {toast && <div className="toast">{toast}</div>}
-      <section className="card home-import-card home-import-top">
-        <h2>{t.installFromUrl}</h2>
-        <p className="card-desc">{t.installFromUrlDesc}</p>
-        <div className="install-url-row">
-          <input
-            type="url"
-            placeholder="https://.../plugin.zip"
-            value={installUrl}
-            onChange={(e) => setInstallUrl(e.target.value)}
-            className="input input-sm"
-            aria-label="Plugin ZIP or DLL URL"
-          />
-          <button
-            type="button"
-            className="btn btn-primary btn-sm"
-            onClick={handleInstallFromUrl}
-            disabled={!installUrl.trim() || installLoading || readOnly}
-          >
-            {installLoading ? t.installing : t.install}
-          </button>
-        </div>
-        <div className="install-paste-row">
-          <input
-            type="text"
-            placeholder={t.pastePathHint}
-            value={pastePath}
-            onChange={(e) => setPastePath(e.target.value)}
-            className="input input-sm"
-            onKeyDown={(e) => { if (e.key === "Enter") { onInstallFromPastePath(pastePath); setPastePath(""); } }}
-          />
-          <button
-            type="button"
-            className="btn btn-outline btn-sm"
-            onClick={() => { onInstallFromPastePath(pastePath); setPastePath(""); }}
-            disabled={!pastePath.trim() || readOnly || importLoading}
-          >
-            {t.install}
-          </button>
-        </div>
-        <div
-          role="button"
-          tabIndex={0}
-          className={`drop-zone ${readOnly ? "drop-zone-disabled" : ""} ${importLoading ? "drop-zone-loading" : ""}`}
-          onClick={() => !readOnly && !importLoading && onImportFromFile()}
-          onKeyDown={(e) => e.key === "Enter" && !readOnly && !importLoading && onImportFromFile()}
-          onContextMenu={(e) => {
-            e.preventDefault();
-            if (readOnly || importLoading) return;
-            const menu = document.createElement("div");
-            menu.className = "context-menu";
-            menu.style.cssText = `left:${e.clientX}px;top:${e.clientY}px`;
-            const btn = document.createElement("button");
-            btn.textContent = t.importFromFile;
-            btn.onclick = () => { onImportFromFile(); close(); };
-            menu.appendChild(btn);
-            const close = () => { menu.remove(); document.removeEventListener("click", close); };
-            document.body.appendChild(menu);
-            requestAnimationFrame(() => document.addEventListener("click", close));
-          }}
-          onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add("drop-zone-active"); }}
-          onDragLeave={(e) => { e.preventDefault(); e.currentTarget.classList.remove("drop-zone-active"); }}
-          onDrop={(e) => {
-            e.preventDefault();
-            e.currentTarget.classList.remove("drop-zone-active");
-            if (readOnly || importLoading) return;
-            const files = Array.from(e.dataTransfer.files);
-            files.forEach((f) => {
-              if (f.name.endsWith(".zip") || f.name.endsWith(".dll")) {
-                onInstallFromPastePath((f as File & { path?: string }).path ?? f.name);
-              }
-            });
-          }}
-          title={t.dropZoneHint}
-        >
-          <span className="drop-zone-icon">📦</span>
-          <span>{importLoading ? t.installing : t.dropZoneHint}</span>
-        </div>
-        <div className="import-extra-row">
-          <button
-            type="button"
-            className="btn btn-ghost btn-sm"
-            onClick={onOpenDownloads}
-            title={t.openDownloads}
-          >
-            {t.openDownloads}
-          </button>
-        </div>
-        {importHistory.length > 0 && (
-          <div className="import-history">
-            <span className="import-history-label">{t.recentImports}:</span>
-            {importHistory.slice(0, 5).map((p: string) => (
-              <button
-                key={p}
-                type="button"
-                className="btn btn-ghost btn-xs import-history-item"
-                onClick={() => onReimportFromHistory(p)}
-                disabled={readOnly || importLoading}
-                title={p}
-              >
-                {p.split(/[/\\]/).pop() || p}
-              </button>
-            ))}
-          </div>
-        )}
-      </section>
-      {(obsRunning || !pathValid) && (
-        <div className="alerts">
+
+      {/* ─── Status alerts ─── */}
+      {(obsRunning || (!pathValid && hasPaths)) && (
+        <div className="home-alerts">
           {obsRunning && (
             <div className="alert alert-warning">
-              {t.obsRunning}
+              <i className="ti ti-alert-triangle" /> {t.obsRunning}
             </div>
           )}
           {hasPaths && !pathValid && (
             <div className="alert alert-error">
-              {t.pathNotExist}
+              <i className="ti ti-folder-off" /> {t.pathNotExist}
             </div>
           )}
         </div>
       )}
-      <section className="card paths-card">
-        <h2>{t.obsFolders}</h2>
-        {hasPaths ? (
-          <>
-            <div className="paths-grid">
-              {paths?.custom_plugins_path && (
-                <div className="path-chip path-custom">
-                  <span className="path-label">{t.customPlugins}</span>
-                  <code>{paths.custom_plugins_path}</code>
-                </div>
-              )}
-              {paths?.plugins_path && (
-                <div className="path-chip">
-                  <span className="path-label">ProgramData</span>
-                  <code>{paths.plugins_path}</code>
-                </div>
-              )}
-              {paths?.appdata_plugins && (
-                <div className="path-chip">
-                  <span className="path-label">AppData</span>
-                  <code>{paths.appdata_plugins}</code>
-                </div>
-              )}
-            </div>
-            <button
-              type="button"
-              className="btn btn-ghost"
-              onClick={onOpenPluginsFolder}
-            >
-              {t.openFolder}
-            </button>
-          </>
-        ) : (
-          <p className="empty-hint">
-            {t.noFolderDetected}
-          </p>
-        )}
-      </section>
 
-      <section className="card plugins-card">
-        <div className="card-header">
-          <h2>{t.installedPlugins} <span className="plugin-count">({plugins.length} installed)</span></h2>
-          <div className="toolbar">
-            <input
-              type="search"
-              ref={searchInputRef}
-              placeholder={t.search}
-              value={searchQuery}
-              onChange={(e) => onSearchChange(e.target.value)}
-              aria-label="Search plugins"
-              className="input-sm"
-            />
-            <select
-              value={statusFilter}
-              onChange={(e) => onStatusFilterChange(e.target.value as StatusFilter)}
-              className="select-sm"
-              aria-label="Filter by status (all, active, disabled)"
-            >
-              <option value="all">{t.all}</option>
-              <option value="active">{t.active}</option>
-              <option value="disabled">{t.disabled}</option>
-            </select>
-            <select
-              value={sortBy}
-              onChange={(e) => onSortChange(e.target.value as SortBy)}
-              className="select-sm"
-              aria-label="Sort plugins by name, path, or date"
-            >
-              <option value="name">{t.name}</option>
-              <option value="path">{t.path}</option>
-              <option value="date">{t.date}</option>
-            </select>
-            <button type="button" className="btn btn-primary btn-sm" onClick={onRefresh} title={t.shortcuts}>
-              {t.refresh}
-            </button>
-            <button type="button" className="btn btn-ghost btn-sm" onClick={onExportPluginsJson} title="Export list as JSON">
-              {t.exportJson}
-            </button>
-            <button type="button" className="btn btn-ghost btn-sm" onClick={onExportPluginsCsv} title="Export list as CSV">
-              {t.exportCsv}
-            </button>
-            <div className="view-mode-toggle" role="group" aria-label="View mode">
-              <button type="button" className={`btn btn-ghost btn-sm ${viewMode === "list" ? "active" : ""}`} onClick={() => onViewModeChange("list")} title={t.listView}>{t.listView}</button>
-              <button type="button" className={`btn btn-ghost btn-sm ${viewMode === "grid" ? "active" : ""}`} onClick={() => onViewModeChange("grid")} title={t.gridView}>{t.gridView}</button>
-            </div>
-            <label className="compact-toggle" title="Denser list" aria-label="Use compact plugin list">
-              <input type="checkbox" checked={compactMode} onChange={(e) => onCompactModeChange(e.target.checked)} />
-              <span>{t.compact}</span>
-            </label>
+      {/* ─── Dashboard stat cards ─── */}
+      <div className="home-stats">
+        <div className="hstat-card">
+          <div className="hstat-icon hstat-icon--total"><i className="ti ti-puzzle" /></div>
+          <div className="hstat-body">
+            <span className="hstat-num">{plugins.length}</span>
+            <span className="hstat-lbl">Total plugins</span>
           </div>
         </div>
-        {loading ? (
-          <div className="loading-state">
-            <div className="spinner" />
-            <span>{t.loading}</span>
-          </div>
-        ) : filteredPlugins.length > 0 ? (
-          <ul className={`plugin-list ${compactMode ? "compact" : ""} view-${viewMode}`}>
-            {filteredPlugins.map((plugin) => {
-              const updateInfo = pluginUpdates?.find((u) => u.plugin_name === plugin.name);
-              return (
-              <li
-                key={`${plugin.name}-${plugin.path}`}
-                className={`plugin-item ${!plugin.enabled ? "disabled" : ""} ${updateInfo ? "has-update" : ""}`}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  const menu = document.createElement("div");
-                  menu.className = "context-menu";
-                  menu.style.cssText = `left:${e.clientX}px;top:${e.clientY}px`;
-                  const items: { label: string; onClick: () => void }[] = [];
-                  if (updateInfo && onUpdatePlugin && !readOnly) {
-                    items.unshift({ label: t.updatePlugin, onClick: () => onUpdatePlugin(updateInfo) });
-                  }
-                  if (updateInfo && onOpenPluginUrl) items.push({ label: t.viewOnForum, onClick: () => onOpenPluginUrl(updateInfo.forum_url) });
-                  if (onOpenPluginFolder) items.push({ label: t.openInFolder, onClick: () => onOpenPluginFolder(plugin.path) });
-                  if (!readOnly) {
-                    if (plugin.enabled) items.push({ label: t.disable, onClick: () => onDisable(plugin) });
-                    else items.push({ label: t.enable, onClick: () => onEnable(plugin) });
-                    items.push({ label: t.uninstall, onClick: () => onUninstall(plugin) });
-                  }
-                  items.forEach(({ label, onClick }) => {
-                    const btn = document.createElement("button");
-                    btn.type = "button";
-                    btn.textContent = label;
-                    btn.onclick = () => { onClick(); menu.remove(); };
-                    menu.appendChild(btn);
-                  });
-                  const close = () => { menu.remove(); document.removeEventListener("click", close); };
-                  document.body.appendChild(menu);
-                  requestAnimationFrame(() => document.addEventListener("click", close));
-                }}
-              >
-                <div className="plugin-main">
-                  <span className="plugin-name">
-                    {plugin.name}
-                    {plugin.version && (
-                      <span className="plugin-version"> v{plugin.version}</span>
-                    )}
-                    {updateInfo && <span className="badge badge-update" title={t.updatesAvailable}>↑</span>}
-                    {!plugin.enabled && (
-                      <span className="badge badge-muted">{t.disabled}</span>
-                    )}
-                  </span>
-                  <span className="plugin-path">{plugin.path}</span>
-                  {plugin.modified_time && (
-                    <span className="plugin-meta">
-                      {formatDate(plugin.modified_time)}
-                    </span>
-                  )}
-                </div>
-                <div className="plugin-btns">
-                  {updateInfo && onUpdatePlugin && (
-                    <button
-                      type="button"
-                      className="btn btn-primary btn-sm"
-                      onClick={() => onUpdatePlugin(updateInfo)}
-                      disabled={readOnly || updatingPlugins?.has(plugin.name)}
-                      title={t.updatePlugin}
-                    >
-                      {updatingPlugins?.has(plugin.name) ? t.installing : t.updatePlugin}
-                    </button>
-                  )}
-                  {plugin.enabled ? (
-                    <button
-                      type="button"
-                      className="btn btn-outline btn-sm"
-                      onClick={() => onDisable(plugin)}
-                      disabled={readOnly}
-                      title={t.disable}
-                    >
-                      {t.disable}
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      className="btn btn-success btn-sm"
-                      onClick={() => onEnable(plugin)}
-                      disabled={readOnly}
-                      title={t.enable}
-                    >
-                      {t.enable}
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    className="btn btn-danger btn-sm"
-                    onClick={() => onUninstall(plugin)}
-                    disabled={readOnly}
-                    title={t.uninstall}
-                  >
-                    {t.uninstall}
-                  </button>
-                </div>
-              </li>
-            );
-            })}
-          </ul>
-        ) : (
-          <p className="empty-hint">
-            {searchQuery || statusFilter !== "all"
-              ? t.noPluginMatch
-              : t.noPlugin}
-          </p>
-        )}
-      </section>
-    </>
-  );
-}
-
-type ForumSort = "name" | "id" | "downloads" | "rating";
-type ForumCategory = "plugins" | "themes" | "tools" | "scripts";
-
-const PLUGINS_PER_PAGE = 24;
-
-/**
- * Discover page: OBS forum plugins, install from URL, drag-drop, download modal.
- * Fetches/scrapes forum, supports search, favorites, category switching.
- */
-function DiscoverPage({
-  installedPluginNames,
-  favorites,
-  searchInputRef,
-  onToggleFavorite,
-  onOpenForum,
-  onOpenPluginUrl,
-  onInstallFromUrl,
-  onTestForum,
-  readOnly,
-  toast,
-}: {
-  installedPluginNames: string[];
-  favorites: string[];
-  searchInputRef: React.RefObject<HTMLInputElement | null>;
-  onToggleFavorite: (forumId: string) => void;
-  onOpenForum: () => void;
-  onOpenPluginUrl: (url: string) => void;
-  onInstallFromUrl: (url: string) => void;
-  onTestForum: () => void;
-  readOnly: boolean;
-  toast: string | null;
-}) {
-  const [forumPlugins, setForumPlugins] = useState<ForumPlugin[]>([]);
-  const [forumLoading, setForumLoading] = useState(false);
-  const [forumError, setForumError] = useState<string | null>(null);
-  const [forumSearch, setForumSearch] = useState("");
-  const [forumSort, setForumSort] = useState<ForumSort>("name");
-  const [forumCategory, setForumCategory] = useState<ForumCategory>("plugins");
-  const [forumFetched, setForumFetched] = useState(false);
-  const [searchResults, setSearchResults] = useState<ForumPlugin[] | null>(null);
-  const [searchLoading, setSearchLoading] = useState(false);
-  const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
-  const [showNotInstalledOnly, setShowNotInstalledOnly] = useState(false);
-  const [currentPage, setCurrentPage] = useState(1);
-  const [downloadModal, setDownloadModal] = useState<{
-    plugin: ForumPlugin;
-    options: DownloadOption[];
-    loading: boolean;
-    error?: string;
-  } | null>(null);
-
-  const openDownloadModal = useCallback(
-    async (plugin: ForumPlugin) => {
-      if (readOnly) return;
-      setDownloadModal({ plugin, options: [], loading: true });
-      try {
-        const opts = await invoke<DownloadOption[]>("fetch_plugin_download_options", {
-          resourceUrl: plugin.url,
-        });
-        setDownloadModal((m) => (m ? { ...m, options: opts, loading: false } : null));
-      } catch (e) {
-        setDownloadModal((m) =>
-          m ? { ...m, options: [], loading: false, error: String(e) } : null
-        );
-      }
-    },
-    [readOnly]
-  );
-
-  const loadForumPlugins = useCallback(async (forceRefresh = false, category?: ForumCategory) => {
-    const cat = category ?? forumCategory;
-    setForumLoading(true);
-    setForumError(null);
-    setSearchResults(null);
-    try {
-      const list = await invoke<ForumPlugin[]>("fetch_forum_plugins", {
-        category: cat,
-        forceRefresh,
-        maxPages: 5,
-      });
-      setForumPlugins(list);
-      setForumFetched(true);
-    } catch (e) {
-      setForumError(String(e));
-      if (!forumFetched) setForumPlugins([]);
-    } finally {
-      setForumLoading(false);
-    }
-  }, [forumFetched, forumCategory]);
-
-  // Load forum plugins on mount (run once with default category)
-  useEffect(() => {
-    loadForumPlugins(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: run once on mount
-  }, []);
-
-  const searchForum = useCallback(async () => {
-    const q = forumSearch.trim();
-    if (!q) return;
-    setSearchLoading(true);
-    setForumError(null);
-    try {
-      const list = await invoke<ForumPlugin[]>("search_forum_resources", { keywords: q });
-      setSearchResults(list);
-    } catch (e) {
-      setForumError(String(e));
-      setSearchResults([]);
-    } finally {
-      setSearchLoading(false);
-    }
-  }, [forumSearch]);
-
-  const baseList = searchResults ?? forumPlugins;
-  const filteredForumPlugins = useMemo(() => {
-    let list = [...baseList];
-    if (searchResults === null) {
-      if (showFavoritesOnly && favorites.length > 0) {
-        const set = new Set(favorites);
-        list = list.filter((p) => set.has(p.id));
-      }
-      if (forumSearch.trim()) {
-        const q = forumSearch.toLowerCase().trim();
-        list = list.filter(
-          (p) =>
-            p.title.toLowerCase().includes(q) ||
-            (p.author?.toLowerCase().includes(q) ?? false) ||
-            p.id.includes(q)
-        );
-      }
-    }
-    if (forumSort === "name") {
-      list.sort((a, b) =>
-        a.title.localeCompare(b.title, undefined, { sensitivity: "base" })
-      );
-    } else if (forumSort === "downloads") {
-      list.sort((a, b) => (b.downloads ?? 0) - (a.downloads ?? 0));
-    } else if (forumSort === "rating") {
-      list.sort((a, b) => {
-        const ra = parseFloat(a.rating ?? "0");
-        const rb = parseFloat(b.rating ?? "0");
-        return rb - ra;
-      });
-    } else {
-      list.sort((a, b) => Number(b.id) - Number(a.id));
-    }
-    return list;
-  }, [baseList, forumSearch, forumSort, showFavoritesOnly, favorites, searchResults]);
-
-  const topResources = filteredForumPlugins.slice(0, 5);
-
-  const isInstalled = useCallback(
-    (title: string) => {
-      const lower = title.toLowerCase();
-      return installedPluginNames.some(
-        (n) => n.toLowerCase() === lower || lower.includes(n.toLowerCase()) || n.toLowerCase().includes(lower)
-      );
-    },
-    [installedPluginNames]
-  );
-
-  const filteredForumPluginsWithNotInstalled = useMemo(() => {
-    if (!showNotInstalledOnly) return filteredForumPlugins;
-    return filteredForumPlugins.filter((p) => !isInstalled(p.title));
-  }, [filteredForumPlugins, showNotInstalledOnly, isInstalled]);
-
-  const effectiveFilteredPlugins = filteredForumPluginsWithNotInstalled;
-  const totalPagesEffective = Math.max(1, Math.ceil(effectiveFilteredPlugins.length / PLUGINS_PER_PAGE));
-  const paginatedPluginsEffective = useMemo(() => {
-    const start = (currentPage - 1) * PLUGINS_PER_PAGE;
-    return effectiveFilteredPlugins.slice(start, start + PLUGINS_PER_PAGE);
-  }, [effectiveFilteredPlugins, currentPage]);
-
-  return (
-    <section className="discover-page">
-      {toast && <div className="toast">{toast}</div>}
-      {downloadModal && (
-        <div className="modal-overlay" onClick={() => setDownloadModal(null)}>
-          <div className="modal card" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3>{t.chooseDownload}</h3>
-              <span className="modal-plugin-name">{downloadModal.plugin.title}</span>
-              <button type="button" className="btn-close" onClick={() => setDownloadModal(null)} aria-label="Close">
-                ×
-              </button>
-            </div>
-            <div className="modal-body">
-              {downloadModal.loading && (
-                <div className="loading-state">
-                  <div className="spinner" />
-                  <span>{t.loading}</span>
-                </div>
-              )}
-              {downloadModal.error && (
-                <div className="alert alert-error">
-                  {downloadModal.error}
-                  <br />
-                  <a href={downloadModal.plugin.url} target="_blank" rel="noopener noreferrer" className="link">
-                    Open in browser
-                  </a>
-                </div>
-              )}
-              {!downloadModal.loading && !downloadModal.error && downloadModal.options.length > 0 && (
-                <ul className="download-options-list">
-                  {downloadModal.options.map((opt, i) => (
-                    <li key={i} className="download-option">
-                      <div className="download-option-info">
-                        <span className="download-option-label">{opt.label}</span>
-                        {opt.size && <span className="download-option-size">{opt.size}</span>}
-                        {opt.source && <span className="download-option-source">{opt.source}</span>}
-                      </div>
-                      <button
-                        type="button"
-                        className="btn btn-primary btn-sm"
-                        onClick={async () => {
-                          try {
-                            await onInstallFromUrl(opt.url);
-                            setDownloadModal(null);
-                          } catch (e) {
-                            // keep modal open, toast will show error
-                          }
-                        }}
-                      >
-                        {t.install}
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
+        <div className="hstat-card">
+          <div className="hstat-icon hstat-icon--active"><i className="ti ti-check" /></div>
+          <div className="hstat-body">
+            <span className="hstat-num hstat-num--green">{activeCount}</span>
+            <span className="hstat-lbl">Active</span>
           </div>
         </div>
-      )}
-
-      <div className="card discover-forum-card discover-toolbar-card">
-        <div className="card-header discover-forum-header">
-          <div>
-            <h2>{t.forumPlugins}</h2>
-            <p className="card-desc">{t.forumDesc}</p>
+        <div className="hstat-card">
+          <div className="hstat-icon hstat-icon--off"><i className="ti ti-eye-off" /></div>
+          <div className="hstat-body">
+            <span className="hstat-num hstat-num--muted">{disabledCount}</span>
+            <span className="hstat-lbl">Disabled</span>
           </div>
-          <div className="btn-row">
-            <button type="button" className="btn btn-ghost" onClick={onOpenForum} title="Open forum in browser">
-              {t.openForum}
-            </button>
-            <button
-              type="button"
-              className="btn btn-ghost"
-              onClick={searchForum}
-              disabled={!forumSearch.trim() || searchLoading}
-              title="Search forum and show results in-app"
-            >
-              {searchLoading ? t.loading : "Search in-app"}
-            </button>
-            <button
-              type="button"
-              className="btn btn-ghost"
-              onClick={() => {
-                const q = forumSearch.trim();
-                const url = q
-                  ? `https://obsproject.com/forum/search/?type=resource&keywords=${encodeURIComponent(q)}`
-                  : "https://obsproject.com/forum/search/?type=resource";
-                invoke("open_url", { url });
-              }}
-              title="Open forum search in browser"
-            >
-              {t.searchOnForum}
-            </button>
-            <button type="button" className="btn btn-ghost" onClick={onTestForum} disabled={forumLoading} title="Test connection">
-              {t.testForum}
-            </button>
-            <button type="button" className="btn btn-ghost" onClick={() => loadForumPlugins(false)} disabled={forumLoading} title="Use cache (20 min)">
-              {t.load}
-            </button>
-            <button type="button" className="btn btn-primary" onClick={() => loadForumPlugins(true)} disabled={forumLoading}>
-              {forumLoading ? t.loading : t.refresh}
-            </button>
+        </div>
+        {updateCount > 0 && (
+          <div className="hstat-card hstat-card--updates">
+            <div className="hstat-icon hstat-icon--update"><i className="ti ti-arrow-up" /></div>
+            <div className="hstat-body">
+              <span className="hstat-num hstat-num--orange">{updateCount}</span>
+              <span className="hstat-lbl">Updates</span>
+            </div>
+          </div>
+        )}
+        <div className="hstat-card hstat-card--obs">
+          <div className="hstat-icon" style={{ background: obsRunning ? "var(--danger-bg)" : "var(--surface-2)", color: obsRunning ? "var(--danger)" : "var(--success)" }}>
+            <i className={`ti ${obsRunning ? "ti-player-stop" : "ti-circle-check"}`} />
+          </div>
+          <div className="hstat-body">
+            <span className="hstat-num" style={{ color: obsRunning ? "var(--danger)" : "var(--success)", fontSize: "0.85rem", fontWeight: 600 }}>
+              {obsRunning ? "Running" : "Not running"}
+            </span>
+            <span className="hstat-lbl">OBS Studio</span>
           </div>
         </div>
       </div>
 
-      {forumLoading && (
-        <div className="loading-state discover-loading">
-          <div className="spinner" />
-          <span>{t.loadForum}</span>
-        </div>
-      )}
+      {/* ─── Quick actions bar ─── */}
+      <div className="home-quickbar">
+        <button type="button" className="hqb-btn hqb-btn--primary" onClick={() => setInstallPanelOpen(v => !v)} disabled={readOnly}>
+          <i className="ti ti-download" /> Install plugin
+          <i className={`ti ti-chevron-${installPanelOpen ? "up" : "down"} hqb-chevron`} />
+        </button>
+        <button type="button" className="hqb-btn" onClick={onRefresh} disabled={loading}>
+          <i className={`ti ti-refresh ${loading ? "spin-icon" : ""}`} /> Refresh
+        </button>
+        <button type="button" className="hqb-btn" onClick={onOpenPluginsFolder}>
+          <i className="ti ti-folder-open" /> Open folder
+        </button>
+        <button type="button" className="hqb-btn" onClick={onExportPluginsJson}>
+          <i className="ti ti-file-export" /> Export JSON
+        </button>
+        <button type="button" className="hqb-btn" onClick={onExportPluginsCsv}>
+          <i className="ti ti-table-export" /> Export CSV
+        </button>
+        <button type="button" className="hqb-btn" onClick={onOpenDownloads}>
+          <i className="ti ti-folder-down" /> Downloads
+        </button>
+      </div>
 
-      {forumError && (
-        <div className="alert alert-error discover-alert">
-          <div className="error-detail">
-            <strong>Error:</strong>
-            <code className="error-raw">{forumError}</code>
+      {/* ─── Install panel (collapsible) ─── */}
+      {installPanelOpen && (
+        <div className="home-install-panel">
+          <div className="hip-row">
+            <div className="hip-field">
+              <label className="hip-label"><i className="ti ti-link" /> Install from URL</label>
+              <div className="hip-input-row">
+                <input
+                  type="url"
+                  className="input input-sm"
+                  placeholder="https://…/plugin.zip"
+                  value={installUrl}
+                  onChange={e => setInstallUrl(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter") handleInstallFromUrl(); }}
+                  aria-label="Plugin URL"
+                />
+                <button type="button" className="btn btn-primary btn-sm" onClick={handleInstallFromUrl} disabled={!installUrl.trim() || installLoading}>
+                  {installLoading ? <><span className="hq-spinner" /> Installing…</> : "Install"}
+                </button>
+              </div>
+            </div>
+            <div className="hip-field">
+              <label className="hip-label"><i className="ti ti-clipboard" /> Paste file path</label>
+              <div className="hip-input-row">
+                <input
+                  type="text"
+                  className="input input-sm"
+                  placeholder="C:\path\to\plugin.zip"
+                  value={pastePath}
+                  onChange={e => setPastePath(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter") { onInstallFromPastePath(pastePath); setPastePath(""); } }}
+                />
+                <button type="button" className="btn btn-outline btn-sm" onClick={() => { onInstallFromPastePath(pastePath); setPastePath(""); }} disabled={!pastePath.trim() || importLoading}>
+                  Install
+                </button>
+              </div>
+            </div>
           </div>
-          <button type="button" className="btn btn-ghost btn-sm retry-btn" onClick={() => loadForumPlugins(true)}>{t.retry}</button>
-        </div>
-      )}
-
-      {forumFetched && !forumLoading && !forumError && (
-        <div className="discover-layout">
-          <aside className="discover-sidebar card">
-            <h3 className="sidebar-title">{t.categories}</h3>
-            <ul className="sidebar-list">
-              {(["plugins", "themes", "tools", "scripts"] as ForumCategory[]).map((cat) => (
-                <li
-                  key={cat}
-                  className={`sidebar-item ${forumCategory === cat ? "active" : ""}`}
-                  onClick={() => {
-                    setForumCategory(cat);
-                    setSearchResults(null);
-                    loadForumPlugins(false, cat);
-                  }}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(e) => e.key === "Enter" && (setForumCategory(cat), setSearchResults(null), loadForumPlugins(false, cat))}
-                >
-                  {cat === "plugins" ? "OBS Studio Plugins" : cat.charAt(0).toUpperCase() + cat.slice(1)}
-                </li>
-              ))}
-            </ul>
-            <h3 className="sidebar-title">{t.topResources}</h3>
-            <ul className="sidebar-top-list">
-              {topResources.length === 0 ? (
-                <li className="sidebar-top-item empty">{t.clickToLoad}</li>
-              ) : (
-                topResources.map((p) => (
-                  <li key={p.id} className="sidebar-top-item">
-                    {p.icon_url ? (
-                      <img src={p.icon_url} alt="" className="sidebar-top-icon-img" />
-                    ) : (
-                      <div className="sidebar-top-icon" />
-                    )}
-                    <div className="sidebar-top-info">
-                      <span className="sidebar-top-name">{p.title}</span>
-                      <span className="sidebar-top-meta">{p.author || "—"} · {p.id}</span>
-                    </div>
-                  </li>
-                ))
-              )}
-            </ul>
-          </aside>
-
-          <main className="discover-main">
-            <div className="discover-header-row">
-              <h1 className="discover-page-title">
-                {forumCategory === "plugins" ? "OBS Studio Plugins" : forumCategory.charAt(0).toUpperCase() + forumCategory.slice(1)}
-              </h1>
-              <span className="discover-live-badge" title="Data from obsproject.com/forum">● Live · obsproject.com</span>
-            </div>
-            <p className="discover-page-subtitle">
-              {forumCategory === "plugins" ? "Plugins for use with OBS Studio." : `OBS ${forumCategory} from the forum.`}
-            </p>
-
-            <div className="discover-filters">
-              <input
-                ref={searchInputRef}
-                type="text"
-                className="input input-sm discover-search"
-                placeholder={t.search}
-                value={forumSearch}
-                onChange={(e) => { setForumSearch(e.target.value); setCurrentPage(1); }}
-                aria-label="Search plugins"
-              />
-              <label className="forum-filter-favorites" aria-label="Show favorites only">
-                <input type="checkbox" checked={showFavoritesOnly} onChange={(e) => setShowFavoritesOnly(e.target.checked)} />
-                <span>{t.favorites}</span>
-              </label>
-              <label className="forum-filter-favorites" aria-label="Show not installed only">
-                <input type="checkbox" checked={showNotInstalledOnly} onChange={(e) => { setShowNotInstalledOnly(e.target.checked); setCurrentPage(1); }} />
-                <span>{t.notInstalled}</span>
-              </label>
-              <select className="select-sm" value={forumSort} onChange={(e) => setForumSort(e.target.value as ForumSort)} aria-label="Sort forum resources">
-                <option value="name">{t.sortByName}</option>
-                <option value="id">{t.sortByRecent}</option>
-                <option value="downloads">Sort by downloads</option>
-                <option value="rating">Sort by rating</option>
-              </select>
-            </div>
-
-            <div className="discover-pagination">
-              {Array.from({ length: totalPagesEffective }, (_, i) => i + 1).slice(0, 8).map((n) => (
-                <button key={n} type="button" className={`pagination-btn ${n === currentPage ? "active" : ""}`} onClick={() => setCurrentPage(n)}>
-                  {n}
+          <div
+            role="button" tabIndex={0}
+            className={`hip-dropzone ${readOnly ? "hip-dropzone--disabled" : ""} ${importLoading ? "hip-dropzone--loading" : ""}`}
+            onClick={() => !readOnly && !importLoading && onImportFromFile()}
+            onKeyDown={e => e.key === "Enter" && !readOnly && !importLoading && onImportFromFile()}
+            onDragOver={e => { e.preventDefault(); e.currentTarget.classList.add("hip-dropzone--active"); }}
+            onDragLeave={e => { e.preventDefault(); e.currentTarget.classList.remove("hip-dropzone--active"); }}
+            onDrop={e => {
+              e.preventDefault(); e.currentTarget.classList.remove("hip-dropzone--active");
+              if (readOnly || importLoading) return;
+              Array.from(e.dataTransfer.files).forEach(f => {
+                if (f.name.endsWith(".zip") || f.name.endsWith(".dll"))
+                  onInstallFromPastePath((f as File & { path?: string }).path ?? f.name);
+              });
+            }}
+          >
+            <i className="ti ti-package" />
+            <span>{importLoading ? "Installing…" : "Drop .zip or .dll here, or click to browse"}</span>
+          </div>
+          {importHistory.length > 0 && (
+            <div className="hip-history">
+              <span className="hip-history-lbl">Recent:</span>
+              {importHistory.slice(0, 5).map(p => (
+                <button key={p} type="button" className="hip-history-btn" onClick={() => onReimportFromHistory(p)} disabled={readOnly || importLoading} title={p}>
+                  {p.split(/[/\\]/).pop() ?? p}
                 </button>
               ))}
-              {totalPagesEffective > 8 && <span className="pagination-ellipsis">…</span>}
-              <button type="button" className="pagination-btn" onClick={() => setCurrentPage((p) => Math.min(p + 1, totalPagesEffective))} disabled={currentPage >= totalPagesEffective}>
-                Next →
-              </button>
             </div>
-
-            <div className="forum-resources-grid">
-              {filteredForumPlugins.length === 0 ? (
-                <p className="empty-hint grid-full">{showFavoritesOnly ? t.noFavorite : t.noForumPlugin}</p>
-              ) : (
-                paginatedPluginsEffective.map((p) => (
-                  <article key={p.id} className="resource-card">
-                    <div className="resource-card-header">
-                      {p.icon_url ? (
-                        <img src={p.icon_url} alt="" className="resource-card-icon" />
-                      ) : (
-                        <div className="resource-card-icon resource-card-icon-placeholder" />
-                      )}
-                      <div className="resource-card-title-block">
-                        <h3 className="resource-card-title">{p.title}{p.version ? ` ${p.version}` : ""}</h3>
-                        <div className="resource-card-meta">
-                          {p.prefix && <span className="resource-prefix">{p.prefix}</span>}
-                          <span>{p.author || "—"}</span>
-                        </div>
-                      </div>
-                      <div className="resource-card-badges">
-                        {isInstalled(p.title) && <span className="badge badge-installed">{t.installed}</span>}
-                        <button type="button" className={`btn-icon favorite-btn ${favorites.includes(p.id) ? "is-favorite" : ""}`} onClick={() => onToggleFavorite(p.id)} title={favorites.includes(p.id) ? t.removeFromFav : t.addToFav} aria-label="Favorite">♥</button>
-                      </div>
-                    </div>
-                    {p.description && <p className="resource-card-desc">{p.description}</p>}
-                    <div className="resource-card-stats">
-                      {p.downloads != null && <span className="resource-stat">↓ {p.downloads.toLocaleString()}</span>}
-                      {p.rating && <span className="resource-stat resource-rating">★ {p.rating}{p.rating_count ? ` (${p.rating_count})` : ""}</span>}
-                      {p.updated && <span className="resource-stat">Updated {p.updated}</span>}
-                    </div>
-                    <div className="resource-card-actions">
-                      {!readOnly && <button type="button" className="btn btn-primary btn-sm" onClick={() => openDownloadModal(p)}>{t.install}</button>}
-                      <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenPluginUrl(p.url)}>{t.viewOnForum}</button>
-                    </div>
-                  </article>
-                ))
-              )}
-            </div>
-          </main>
+          )}
         </div>
       )}
-    </section>
+
+      {/* ─── OBS paths ─── */}
+      {hasPaths && (
+        <div className="home-paths-bar">
+          <i className="ti ti-folders home-paths-icon" />
+          <div className="home-paths-chips">
+            {paths?.custom_plugins_path && (
+              <div className="hpath-chip hpath-chip--custom">
+                <span>Custom</span><code>{paths.custom_plugins_path}</code>
+              </div>
+            )}
+            {paths?.plugins_path && (
+              <div className="hpath-chip"><span>Plugins</span><code>{paths.plugins_path}</code></div>
+            )}
+            {paths?.appdata_plugins && (
+              <div className="hpath-chip"><span>AppData</span><code>{paths.appdata_plugins}</code></div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ─── Updates banner ─── */}
+      {updateCount > 0 && (
+        <div className="home-updates-banner">
+          <div className="hub-left">
+            <i className="ti ti-arrow-up-circle" />
+            <strong>{updateCount} update{updateCount > 1 ? "s" : ""} available</strong>
+          </div>
+          <div className="hub-items">
+            {pluginUpdates?.slice(0, 3).map(u => (
+              <div key={u.plugin_name} className="hub-item">
+                <span className="hub-name">{u.plugin_name}</span>
+                {u.installed_version && (
+                  <span className="hub-ver">v{u.installed_version} → v{u.available_version ?? "?"}</span>
+                )}
+                <button type="button" className="btn btn-primary btn-sm" onClick={() => onUpdatePlugin?.(u)} disabled={readOnly || updatingPlugins?.has(u.plugin_name)}>
+                  {updatingPlugins?.has(u.plugin_name) ? "Updating…" : "Update"}
+                </button>
+                {onOpenPluginUrl && (
+                  <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenPluginUrl(u.forum_url)}>
+                    <i className="ti ti-external-link" />
+                  </button>
+                )}
+              </div>
+            ))}
+            {updateCount > 3 && <span className="hub-more">+{updateCount - 3} more</span>}
+          </div>
+        </div>
+      )}
+
+      {/* ─── Plugin list section ─── */}
+      <div className="home-plugins-section">
+        {/* toolbar */}
+        <div className="hp-toolbar">
+          <div className="hp-toolbar-left">
+            <h2 className="hp-title">
+              Installed plugins
+              <span className="hp-count">{filteredPlugins.length !== plugins.length ? `${filteredPlugins.length} / ${plugins.length}` : plugins.length}</span>
+            </h2>
+          </div>
+          <div className="hp-toolbar-right">
+            <div className="hp-search-wrap">
+              <i className="ti ti-search hp-search-icon" />
+              <input
+                ref={searchInputRef}
+                type="search"
+                className="hp-search-input"
+                placeholder="Search…"
+                value={searchQuery}
+                onChange={e => onSearchChange(e.target.value)}
+                aria-label="Search plugins"
+              />
+              {searchQuery && (
+                <button type="button" className="hp-search-clear" onClick={() => onSearchChange("")} aria-label="Clear">
+                  <i className="ti ti-x" />
+                </button>
+              )}
+            </div>
+            <div className="hp-filter-group">
+              <button type="button" className={`hp-filter-btn ${statusFilter === "all" ? "active" : ""}`} onClick={() => onStatusFilterChange("all")}>All</button>
+              <button type="button" className={`hp-filter-btn ${statusFilter === "active" ? "active" : ""}`} onClick={() => onStatusFilterChange("active")}>
+                <i className="ti ti-check" /> Active
+              </button>
+              <button type="button" className={`hp-filter-btn ${statusFilter === "disabled" ? "active" : ""}`} onClick={() => onStatusFilterChange("disabled")}>
+                <i className="ti ti-eye-off" /> Disabled
+              </button>
+            </div>
+            <select className="dsc-sort-select" value={sortBy} onChange={e => onSortChange(e.target.value as SortBy)}>
+              <option value="name">A → Z</option>
+              <option value="date">Recent first</option>
+              <option value="path">By path</option>
+            </select>
+            <div className="dsc-view-toggle">
+              <button type="button" className={`dsc-view-btn ${viewMode === "list" ? "active" : ""}`} onClick={() => onViewModeChange("list")} title="List">
+                <i className="ti ti-list" />
+              </button>
+              <button type="button" className={`dsc-view-btn ${viewMode === "grid" ? "active" : ""}`} onClick={() => onViewModeChange("grid")} title="Grid">
+                <i className="ti ti-grid-dots" />
+              </button>
+            </div>
+            <label className="hp-compact-toggle" title="Compact mode">
+              <input type="checkbox" checked={compactMode} onChange={e => onCompactModeChange(e.target.checked)} />
+              <i className="ti ti-layout-distribute-vertical" />
+            </label>
+          </div>
+        </div>
+
+        {/* list */}
+        {loading ? (
+          <div className="hp-loading">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <div key={i} className="hp-skel">
+                <div className="hp-skel-dot" />
+                <div className="hp-skel-lines">
+                  <div className="hp-skel-line hp-skel-name" />
+                  <div className="hp-skel-line hp-skel-path" />
+                </div>
+                <div className="hp-skel-btns">
+                  <div className="hp-skel-btn" />
+                  <div className="hp-skel-btn" />
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : filteredPlugins.length === 0 ? (
+          <div className="hp-empty">
+            <i className="ti ti-mood-empty" />
+            <p>{searchQuery || statusFilter !== "all" ? t.noPluginMatch : t.noPlugin}</p>
+            {!plugins.length && (
+              <button type="button" className="btn btn-outline btn-sm" onClick={onOpenPluginsFolder}>
+                Open plugins folder
+              </button>
+            )}
+          </div>
+        ) : (
+          <ul className={`hp-list ${compactMode ? "hp-list--compact" : ""} hp-list--${viewMode}`}>
+            {filteredPlugins.map(plugin => {
+              const updateInfo = pluginUpdates?.find(u => u.plugin_name === plugin.name);
+              const isExpanded = expandedPlugin === `${plugin.name}-${plugin.path}`;
+              const key = `${plugin.name}-${plugin.path}`;
+
+              if (viewMode === "grid") {
+                return (
+                  <li key={key} className={`hp-grid-card ${!plugin.enabled ? "hp-grid-card--off" : ""} ${updateInfo ? "hp-grid-card--update" : ""}`}>
+                    <div className="hp-gc-head">
+                      <div className={`hp-gc-dot ${plugin.enabled ? "hp-gc-dot--on" : "hp-gc-dot--off"}`} />
+                      <div className="hp-gc-name">
+                        {plugin.name}
+                        {plugin.version && <span className="hp-ver"> v{plugin.version}</span>}
+                      </div>
+                      {updateInfo && <span className="hp-badge-update" title="Update available"><i className="ti ti-arrow-up" /></span>}
+                    </div>
+                    <div className="hp-gc-path" title={plugin.path}>{plugin.path}</div>
+                    {plugin.modified_time && <div className="hp-gc-date">{formatDate(plugin.modified_time)}</div>}
+                    <div className="hp-gc-actions">
+                      {plugin.enabled
+                        ? <button type="button" className="btn btn-outline btn-sm" onClick={() => onDisable(plugin)} disabled={readOnly}><i className="ti ti-eye-off" /></button>
+                        : <button type="button" className="btn btn-success btn-sm" onClick={() => onEnable(plugin)} disabled={readOnly}><i className="ti ti-eye" /></button>
+                      }
+                      <button type="button" className="btn btn-danger btn-sm" onClick={() => onUninstall(plugin)} disabled={readOnly}><i className="ti ti-trash" /></button>
+                      {onOpenPluginFolder && (
+                        <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenPluginFolder(plugin.path)} title="Open folder"><i className="ti ti-folder" /></button>
+                      )}
+                    </div>
+                  </li>
+                );
+              }
+
+              return (
+                <li key={key} className={`hp-item ${!plugin.enabled ? "hp-item--off" : ""} ${updateInfo ? "hp-item--update" : ""} ${compactMode ? "" : "hp-item--expandable"}`}>
+                  <div className="hp-item-main" onClick={() => !compactMode && setExpandedPlugin(isExpanded ? null : key)} style={{ cursor: compactMode ? "default" : "pointer" }}>
+                    <div className={`hp-status-dot ${plugin.enabled ? "hp-status-dot--on" : "hp-status-dot--off"}`} title={plugin.enabled ? "Active" : "Disabled"} />
+                    <div className="hp-item-info">
+                      <div className="hp-item-name">
+                        {plugin.name}
+                        {plugin.version && <span className="hp-ver"> v{plugin.version}</span>}
+                        {!plugin.enabled && <span className="hp-badge-off">Disabled</span>}
+                        {updateInfo && <span className="hp-badge-update"><i className="ti ti-arrow-up" /> Update</span>}
+                      </div>
+                      {(compactMode || !isExpanded) && (
+                        <div className="hp-item-path" title={plugin.path}>{plugin.path}</div>
+                      )}
+                    </div>
+                    {plugin.modified_time && !compactMode && (
+                      <span className="hp-item-date">{formatDate(plugin.modified_time)}</span>
+                    )}
+                  </div>
+
+                  {/* Expanded details */}
+                  {isExpanded && !compactMode && (
+                    <div className="hp-item-detail">
+                      <div className="hp-detail-row">
+                        <i className="ti ti-folder" /><code>{plugin.path}</code>
+                      </div>
+                      {plugin.modified_time && (
+                        <div className="hp-detail-row">
+                          <i className="ti ti-clock" /><span>Last modified: {formatDate(plugin.modified_time)}</span>
+                        </div>
+                      )}
+                      {updateInfo && (
+                        <div className="hp-detail-row hp-detail-update">
+                          <i className="ti ti-arrow-up-circle" />
+                          <span>Update available: v{updateInfo.installed_version} → v{updateInfo.available_version ?? "?"}</span>
+                          {onOpenPluginUrl && (
+                            <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenPluginUrl(updateInfo.forum_url)}>
+                              <i className="ti ti-external-link" /> Forum
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="hp-item-btns">
+                    {updateInfo && onUpdatePlugin && (
+                      <button type="button" className="btn btn-primary btn-sm" onClick={() => onUpdatePlugin(updateInfo)} disabled={readOnly || updatingPlugins?.has(plugin.name)}>
+                        <i className="ti ti-arrow-up" /> {updatingPlugins?.has(plugin.name) ? "Updating…" : "Update"}
+                      </button>
+                    )}
+                    {plugin.enabled
+                      ? <button type="button" className="btn btn-outline btn-sm" onClick={() => onDisable(plugin)} disabled={readOnly} title="Disable"><i className="ti ti-eye-off" />{!compactMode && " Disable"}</button>
+                      : <button type="button" className="btn btn-success btn-sm" onClick={() => onEnable(plugin)} disabled={readOnly} title="Enable"><i className="ti ti-eye" />{!compactMode && " Enable"}</button>
+                    }
+                    <button type="button" className="btn btn-danger btn-sm" onClick={() => onUninstall(plugin)} disabled={readOnly} title="Uninstall">
+                      <i className="ti ti-trash" />{!compactMode && " Uninstall"}
+                    </button>
+                    {onOpenPluginFolder && (
+                      <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenPluginFolder(plugin.path)} title="Open in folder">
+                        <i className="ti ti-folder" />
+                      </button>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+    </div>
   );
 }
 
-/**
- * Options page: custom paths, auto-backup, read-only, theme, export/import.
- */
+// ─────────────────────────────────────────────────────────────────────────
+// Options Page
+// ─────────────────────────────────────────────────────────────────────────
 function OptionsPage({
   customPluginsPath,
   customObsPath,
@@ -1047,178 +674,182 @@ function OptionsPage({
   onLangChange: (v: Lang) => void;
 }) {
   return (
-    <section className="options-page card">
-      <h2>{t.customPaths}</h2>
-      <p>{t.customPathsDesc}</p>
-      <div className="form-group">
-        <label>{t.pluginsFolder}</label>
-        <div className="input-row">
-          <input
-            type="text"
-            value={customPluginsPath}
-            onChange={(e) => onPluginsPathChange(e.target.value)}
-            placeholder="C:\ProgramData\obs-studio\plugins"
-            className={`input ${pathErrors.plugins ? "input-error" : ""}`}
-          />
-          <button type="button" className="btn btn-ghost" onClick={onBrowsePlugins}>
-            {t.browse}
-          </button>
+    <div className="opt-page">
+      {/* ─── Appearance ─── */}
+      <div className="opt-section">
+        <div className="opt-section-head">
+          <i className="ti ti-palette" />
+          <h2>Appearance</h2>
         </div>
-        {pathErrors.plugins && <span className="field-error">{pathErrors.plugins}</span>}
-      </div>
-      <div className="form-group">
-        <label>{t.obsInstallFolder}</label>
-        <div className="input-row">
-          <input
-            type="text"
-            value={customObsPath}
-            onChange={(e) => onObsPathChange(e.target.value)}
-            placeholder="C:\Program Files\obs-studio"
-            className={`input ${pathErrors.obs ? "input-error" : ""}`}
-          />
-          <button type="button" className="btn btn-ghost" onClick={onBrowseObs}>
-            {t.browse}
-          </button>
+        <div className="opt-row">
+          <div className="opt-label-block">
+            <span>Theme</span>
+            <span className="opt-hint">Choose your preferred color scheme</span>
+          </div>
+          <div className="opt-theme-btns">
+            {(["dark","light","system"] as const).map(v => (
+              <button key={v} type="button" className={`opt-theme-btn ${theme === v ? "active" : ""}`} onClick={() => onThemeChange(v)}>
+                <i className={`ti ${v === "dark" ? "ti-moon" : v === "light" ? "ti-sun" : "ti-device-laptop"}`} />
+                {v === "dark" ? t.darkMode : v === "light" ? t.lightMode : t.systemTheme}
+              </button>
+            ))}
+          </div>
         </div>
-        {pathErrors.obs && <span className="field-error">{pathErrors.obs}</span>}
-      </div>
-      <div className="form-group options-checkbox">
-        <label className="checkbox-label">
-          <input
-            type="checkbox"
-            checked={autoBackup}
-            onChange={(e) => onAutoBackupChange(e.target.checked)}
-          />
-          <span>{t.autoBackup}</span>
-        </label>
-        <p className="option-hint">{t.autoBackupDesc}</p>
-      </div>
-      <button
-        type="button"
-        className="btn btn-primary"
-        onClick={onSave}
-        disabled={saving || !!(pathErrors.plugins || pathErrors.obs)}
-      >
-        {saving ? t.saving : t.save}
-      </button>
-
-      <hr className="options-separator" />
-
-      <h2>{t.backupAll}</h2>
-      <p className="option-hint">{t.backupAllDesc}</p>
-      <div className="btn-row options-export-row">
-        <button type="button" className="btn btn-ghost" onClick={onBackupAll}>
-          {t.backupAll}
-        </button>
+        <div className="opt-row">
+          <div className="opt-label-block">
+            <span>Language</span>
+            <span className="opt-hint">UI display language</span>
+          </div>
+          <select className="dsc-sort-select" value={lang} onChange={e => onLangChange(e.target.value as Lang)} aria-label="Language">
+            <option value="en">🇬🇧 English</option>
+            <option value="fr">🇫🇷 Français</option>
+          </select>
+        </div>
       </div>
 
-      <hr className="options-separator" />
-
-      <h2>{t.profiles}</h2>
-      <p className="option-hint">{t.profilesDesc}</p>
-      <div className="btn-row options-export-row">
-        <button type="button" className="btn btn-ghost" onClick={onSaveProfile} disabled={readOnly}>
-          {t.saveProfile}
-        </button>
-        <button type="button" className="btn btn-ghost" onClick={onApplyProfile} disabled={readOnly}>
-          {t.applyProfile}
-        </button>
-      </div>
-
-      <hr className="options-separator" />
-
-      <h2>{t.backupRestore}</h2>
-      <p className="option-hint">{t.backupRestoreDesc}</p>
-      <div className="btn-row options-export-row">
-        <button type="button" className="btn btn-ghost" onClick={onExport}>
-          {t.exportConfig}
-        </button>
-        <button type="button" className="btn btn-ghost" onClick={onImport}>
-          {t.importConfig}
-        </button>
-      </div>
-
-      <hr className="options-separator" />
-
-      <h2>Debug</h2>
-      <p className="option-hint">{t.configPath}: <code className="config-path">{configPath || "—"}</code></p>
-      <div className="btn-row options-export-row">
-        <button type="button" className="btn btn-ghost" onClick={onOpenLog}>
-          {t.openLog}
-        </button>
-      </div>
-
-      <hr className="options-separator" />
-
-      <h2>{t.theme}</h2>
-      <div className="form-group options-checkbox">
-        <div className="btn-row">
-          <button
-            type="button"
-            className={`btn ${theme === "dark" ? "btn-primary" : "btn-ghost"}`}
-            onClick={() => onThemeChange("dark")}
-          >
-            {t.darkMode}
-          </button>
-          <button
-            type="button"
-            className={`btn ${theme === "light" ? "btn-primary" : "btn-ghost"}`}
-            onClick={() => onThemeChange("light")}
-          >
-            {t.lightMode}
-          </button>
-          <button
-            type="button"
-            className={`btn ${theme === "system" ? "btn-primary" : "btn-ghost"}`}
-            onClick={() => onThemeChange("system")}
-          >
-            {t.systemTheme}
+      {/* ─── Paths ─── */}
+      <div className="opt-section">
+        <div className="opt-section-head">
+          <i className="ti ti-folders" />
+          <h2>Paths</h2>
+          <span className="opt-section-sub">Override auto-detected OBS paths</span>
+        </div>
+        <div className="opt-path-row">
+          <label className="opt-path-label">
+            <i className="ti ti-puzzle" /> Plugins folder
+          </label>
+          <div className="opt-path-input">
+            <input type="text" value={customPluginsPath} onChange={e => onPluginsPathChange(e.target.value)}
+              placeholder="C:\ProgramData\obs-studio\plugins"
+              className={`input ${pathErrors.plugins ? "input-error" : ""}`} />
+            <button type="button" className="btn btn-ghost" onClick={onBrowsePlugins}><i className="ti ti-folder-open" /></button>
+          </div>
+          {pathErrors.plugins && <span className="opt-field-error"><i className="ti ti-alert-circle" /> {pathErrors.plugins}</span>}
+        </div>
+        <div className="opt-path-row">
+          <label className="opt-path-label">
+            <i className="ti ti-brand-obs" /> OBS install folder
+          </label>
+          <div className="opt-path-input">
+            <input type="text" value={customObsPath} onChange={e => onObsPathChange(e.target.value)}
+              placeholder="C:\Program Files\obs-studio"
+              className={`input ${pathErrors.obs ? "input-error" : ""}`} />
+            <button type="button" className="btn btn-ghost" onClick={onBrowseObs}><i className="ti ti-folder-open" /></button>
+          </div>
+          {pathErrors.obs && <span className="opt-field-error"><i className="ti ti-alert-circle" /> {pathErrors.obs}</span>}
+        </div>
+        <div className="opt-save-row">
+          <button type="button" className="btn btn-primary" onClick={onSave} disabled={saving || !!(pathErrors.plugins || pathErrors.obs)}>
+            {saving ? <><span className="hq-spinner" /> Saving…</> : <><i className="ti ti-device-floppy" /> Save paths</>}
           </button>
         </div>
       </div>
 
-      <h2>{t.language}</h2>
-      <div className="form-group options-checkbox">
-        <select
-          value={lang}
-          onChange={(e) => onLangChange(e.target.value as Lang)}
-          className="select-sm"
-          aria-label="Language"
-        >
-          <option value="en">English</option>
-          <option value="fr">Français</option>
-        </select>
+      {/* ─── Behavior ─── */}
+      <div className="opt-section">
+        <div className="opt-section-head">
+          <i className="ti ti-settings" />
+          <h2>Behavior</h2>
+        </div>
+        <div className="opt-toggle-row">
+          <div className="opt-label-block">
+            <span>Auto backup</span>
+            <span className="opt-hint">Automatically backup plugins before uninstalling</span>
+          </div>
+          <label className="opt-switch">
+            <input type="checkbox" checked={autoBackup} onChange={e => onAutoBackupChange(e.target.checked)} />
+            <span className="opt-switch-track" />
+          </label>
+        </div>
+        <div className="opt-toggle-row">
+          <div className="opt-label-block">
+            <span>Read-only mode</span>
+            <span className="opt-hint">Prevent all modifications (install, uninstall, enable/disable)</span>
+          </div>
+          <label className="opt-switch">
+            <input type="checkbox" checked={readOnly} onChange={e => onReadOnlyChange(e.target.checked)} />
+            <span className="opt-switch-track" />
+          </label>
+        </div>
       </div>
 
-      <hr className="options-separator" />
+      {/* ─── Profiles ─── */}
+      <div className="opt-section">
+        <div className="opt-section-head">
+          <i className="ti ti-user-circle" />
+          <h2>Plugin profiles</h2>
+          <span className="opt-section-sub">Save and restore sets of enabled plugins</span>
+        </div>
+        <div className="opt-action-grid">
+          <button type="button" className="opt-action-btn" onClick={onSaveProfile} disabled={readOnly}>
+            <i className="ti ti-device-floppy" />
+            <span>Save profile</span>
+            <span className="opt-action-hint">Export current enabled plugins to JSON</span>
+          </button>
+          <button type="button" className="opt-action-btn" onClick={onApplyProfile} disabled={readOnly}>
+            <i className="ti ti-player-play" />
+            <span>Apply profile</span>
+            <span className="opt-action-hint">Load a profile and enable/disable matching plugins</span>
+          </button>
+        </div>
+      </div>
 
-      <h2>Advanced</h2>
-      <div className="form-group options-checkbox">
-        <label className="checkbox-label">
-          <input
-            type="checkbox"
-            checked={readOnly}
-            onChange={(e) => onReadOnlyChange(e.target.checked)}
-          />
-          <span>{t.readOnly}</span>
-        </label>
-        <p className="option-hint">{t.readOnlyDesc}</p>
+      {/* ─── Backup & Config ─── */}
+      <div className="opt-section">
+        <div className="opt-section-head">
+          <i className="ti ti-database" />
+          <h2>Backup &amp; config</h2>
+        </div>
+        <div className="opt-action-grid">
+          <button type="button" className="opt-action-btn" onClick={onBackupAll}>
+            <i className="ti ti-archive" />
+            <span>Backup all plugins</span>
+            <span className="opt-action-hint">Create a ZIP backup of all plugin files</span>
+          </button>
+          <button type="button" className="opt-action-btn" onClick={onExport}>
+            <i className="ti ti-file-export" />
+            <span>Export config</span>
+            <span className="opt-action-hint">Save settings and favorites to JSON</span>
+          </button>
+          <button type="button" className="opt-action-btn" onClick={onImport}>
+            <i className="ti ti-file-import" />
+            <span>Import config</span>
+            <span className="opt-action-hint">Restore settings from a backup JSON</span>
+          </button>
+          <button type="button" className="opt-action-btn" onClick={onExportFavorites}>
+            <i className="ti ti-heart" />
+            <span>Export favorites</span>
+            <span className="opt-action-hint">Save your Discovery favorites list</span>
+          </button>
+          <button type="button" className="opt-action-btn" onClick={onImportFavorites}>
+            <i className="ti ti-heart-plus" />
+            <span>Import favorites</span>
+            <span className="opt-action-hint">Restore a favorites list</span>
+          </button>
+        </div>
       </div>
-      <div className="btn-row options-export-row">
-        <button type="button" className="btn btn-ghost" onClick={onExportFavorites}>
-          {t.exportFavorites}
-        </button>
-        <button type="button" className="btn btn-ghost" onClick={onImportFavorites}>
-          {t.importFavorites}
+
+      {/* ─── Debug ─── */}
+      <div className="opt-section opt-section--debug">
+        <div className="opt-section-head">
+          <i className="ti ti-bug" />
+          <h2>Debug</h2>
+        </div>
+        <div className="opt-debug-row">
+          <span className="opt-hint">Config directory</span>
+          <code className="opt-code">{configPath || "—"}</code>
+        </div>
+        <button type="button" className="btn btn-ghost btn-sm" onClick={onOpenLog}>
+          <i className="ti ti-folder-open" /> Open log folder
         </button>
       </div>
-    </section>
+    </div>
   );
 }
 
-/**
- * Logs page: action history (detailed) and backend log file.
- */
+// ─────────────────────────────────────────────────────────────────────────
+// Logs Page
+// ─────────────────────────────────────────────────────────────────────────
 function LogsPage({
   actionLog,
   onOpenLog,
@@ -1226,96 +857,792 @@ function LogsPage({
   actionLog: ActionLog[];
   onOpenLog: () => void;
 }) {
-  const [backendLog, setBackendLog] = useState<string | null>(null);
-  const [backendLogError, setBackendLogError] = useState<string | null>(null);
+  const [backendLog,        setBackendLog]        = useState<string | null>(null);
+  const [backendLogError,   setBackendLogError]   = useState<string | null>(null);
   const [backendLogLoading, setBackendLogLoading] = useState(true);
-  const [logDir, setLogDir] = useState<string | null>(null);
+  const [logDir,            setLogDir]            = useState<string | null>(null);
+  const [activeTab,         setActiveTab]         = useState<"actions"|"backend">("actions");
+  const [filterText,        setFilterText]        = useState("");
+  const logEndRef = useRef<HTMLDivElement>(null);
 
   const loadBackendLog = useCallback(() => {
     setBackendLogLoading(true);
     setBackendLogError(null);
     invoke<string>("read_log_file")
       .then(setBackendLog)
-      .catch((e) => setBackendLogError(String(e)))
+      .catch(e => setBackendLogError(String(e)))
       .finally(() => setBackendLogLoading(false));
   }, []);
 
   useEffect(() => {
     loadBackendLog();
-    invoke<string | null>("get_config_dir")
-      .then((dir) => setLogDir(dir ?? null))
-      .catch(() => setLogDir(null));
+    invoke<string | null>("get_config_dir").then(d => setLogDir(d ?? null)).catch(() => setLogDir(null));
   }, [loadBackendLog, actionLog]);
 
+  useEffect(() => {
+    if (activeTab === "backend") logEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [backendLog, activeTab]);
+
+  const filteredActions = useMemo(() => {
+    if (!filterText.trim()) return actionLog;
+    const q = filterText.toLowerCase();
+    return actionLog.filter(a =>
+      a.action.toLowerCase().includes(q) ||
+      (a.plugin?.toLowerCase().includes(q) ?? false) ||
+      (a.details?.toLowerCase().includes(q) ?? false)
+    );
+  }, [actionLog, filterText]);
+
+  const actionIcons: Record<string, string> = {
+    "Refresh": "ti-refresh", "Installed": "ti-download", "Updated": "ti-arrow-up",
+    "Uninstalled": "ti-trash", "Disabled": "ti-eye-off", "Enabled": "ti-eye",
+    "Backup created": "ti-archive", "Export list": "ti-file-export",
+    "Profile saved": "ti-device-floppy", "Profile applied": "ti-player-play",
+    "Config exported": "ti-file-export", "Config imported": "ti-file-import",
+  };
+
   return (
-    <section className="logs-page-container">
-      <div className="card logs-page">
-        <div className="logs-page-header">
-          <h2>{t.actionHistory}</h2>
-          <button type="button" className="btn btn-ghost btn-sm" onClick={onOpenLog}>
-            {t.openLog}
-          </button>
-        </div>
-        {actionLog.length > 0 ? (
-          <ul className="logs-list logs-list-detailed">
-            {actionLog.map((a) => (
-              <li key={a.id} className="logs-item logs-item-detailed">
-                <span className="logs-datetime" title={a.date}>
-                  {a.date} {a.time}
-                </span>
-                <span className="logs-action">{a.action}</span>
-                {a.plugin && <span className="logs-plugin">{a.plugin}</span>}
-                {a.details && (
-                  <span className="logs-details" title={a.details}>
-                    {a.details.length > 80 ? `${a.details.slice(0, 80)}…` : a.details}
-                  </span>
-                )}
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="empty-hint">{t.noRecentAction}</p>
-        )}
+    <div className="logs-page-v2">
+      {/* tab bar */}
+      <div className="logs-tabs">
+        <button type="button" className={`logs-tab ${activeTab === "actions" ? "active" : ""}`} onClick={() => setActiveTab("actions")}>
+          <i className="ti ti-list-check" /> Action history
+          {actionLog.length > 0 && <span className="logs-tab-badge">{actionLog.length}</span>}
+        </button>
+        <button type="button" className={`logs-tab ${activeTab === "backend" ? "active" : ""}`} onClick={() => setActiveTab("backend")}>
+          <i className="ti ti-terminal" /> Backend log
+        </button>
+        <div className="logs-tabs-spacer" />
+        <button type="button" className="btn btn-ghost btn-sm" onClick={onOpenLog}>
+          <i className="ti ti-folder-open" /> Open log folder
+        </button>
       </div>
 
-      <div className="card logs-backend">
-        <div className="logs-page-header">
-          <h2>{t.backendLog}</h2>
-          <div className="logs-backend-actions">
+      {/* ── actions tab ── */}
+      {activeTab === "actions" && (
+        <div className="logs-actions-pane">
+          <div className="logs-filter-bar">
+            <i className="ti ti-search" />
+            <input type="search" className="logs-filter-input" placeholder="Filter events…"
+              value={filterText} onChange={e => setFilterText(e.target.value)} />
+            {filterText && (
+              <button type="button" className="dsc-sb-search-clear" onClick={() => setFilterText("")} aria-label="Clear"><i className="ti ti-x" /></button>
+            )}
+            <span className="logs-filter-count">{filteredActions.length} event{filteredActions.length !== 1 ? "s" : ""}</span>
+          </div>
+
+          {filteredActions.length === 0 ? (
+            <div className="logs-empty">
+              <i className="ti ti-ghost" />
+              <p>{filterText ? "No events match this filter" : t.noRecentAction}</p>
+            </div>
+          ) : (
+            <ul className="logs-timeline">
+              {filteredActions.map((a, idx) => {
+                const icon = Object.entries(actionIcons).find(([k]) => a.action.toLowerCase().includes(k.toLowerCase()))?.[1] ?? "ti-point";
+                const isFirst = idx === 0 || filteredActions[idx-1].date !== a.date;
+                return (
+                  <li key={a.id} className="logs-entry">
+                    {isFirst && <div className="logs-date-sep">{a.date}</div>}
+                    <div className="logs-entry-inner">
+                      <div className="logs-entry-icon"><i className={`ti ${icon}`} /></div>
+                      <div className="logs-entry-body">
+                        <div className="logs-entry-top">
+                          <span className="logs-entry-action">{a.action}</span>
+                          {a.plugin && <span className="logs-entry-plugin"><i className="ti ti-puzzle" /> {a.plugin}</span>}
+                          <span className="logs-entry-time">{a.time}</span>
+                        </div>
+                        {a.details && <div className="logs-entry-details">{a.details.length > 120 ? `${a.details.slice(0,120)}…` : a.details}</div>}
+                      </div>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {/* ── backend log tab ── */}
+      {activeTab === "backend" && (
+        <div className="logs-backend-pane">
+          <div className="logs-backend-header">
+            {logDir && <code className="opt-code">{logDir}</code>}
             <button type="button" className="btn btn-ghost btn-sm" onClick={loadBackendLog}>
-              {t.refresh}
+              <i className="ti ti-refresh" /> Refresh
             </button>
-            <button type="button" className="btn btn-ghost btn-sm" onClick={onOpenLog}>
-              {t.openLog}
-            </button>
+          </div>
+          {backendLogLoading ? (
+            <div className="dsc-loading-center" style={{ padding: "3rem" }}>
+              <div className="spinner" /><span>Loading log…</span>
+            </div>
+          ) : backendLogError ? (
+            <div className="alert alert-error">{backendLogError}</div>
+          ) : backendLog?.trim() ? (
+            <pre className="logs-backend-pre">{backendLog}</pre>
+          ) : (
+            <div className="logs-empty"><i className="ti ti-ghost" /><p>{t.logEmpty}</p></div>
+          )}
+          <div ref={logEndRef} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// Discover Page
+// ============================================================
+type ForumSort = "name" | "id" | "downloads" | "rating";
+type ForumCategory = "plugins" | "themes" | "tools" | "scripts";
+type DiscoverView = "grid" | "list";
+
+const PLUGINS_PER_PAGE = 30;
+const SIDEBAR_CAT_META: Record<ForumCategory, { label: string; icon: string; color: string }> = {
+  plugins: { label: "Plugins",  icon: "ti-puzzle",  color: "#7c6dfa" },
+  themes:  { label: "Themes",   icon: "ti-palette", color: "#f07f3c" },
+  tools:   { label: "Tools",    icon: "ti-tool",    color: "#3cb8f0" },
+  scripts: { label: "Scripts",  icon: "ti-code",    color: "#4caf50" },
+};
+
+/**
+ * Discover — store-style page with sidebar nav, search hero, grid/list toggle,
+ * configurable scrape depth (1–15 pages), tag cloud, and skeleton loading.
+ */
+function DiscoverPage({
+  installedPluginNames,
+  favorites,
+  searchInputRef,
+  onToggleFavorite,
+  onOpenForum,
+  onOpenPluginUrl,
+  onInstallFromUrl,
+  onTestForum,
+  readOnly,
+  toast,
+}: {
+  installedPluginNames: string[];
+  favorites: string[];
+  searchInputRef: React.RefObject<HTMLInputElement | null>;
+  onToggleFavorite: (forumId: string) => void;
+  onOpenForum: () => void;
+  onOpenPluginUrl: (url: string) => void;
+  onInstallFromUrl: (url: string) => void;
+  onTestForum: () => void;
+  readOnly: boolean;
+  toast: string | null;
+}) {
+  // ── data
+  const [forumPlugins, setForumPlugins]     = useState<ForumPlugin[]>([]);
+  const [forumLoading, setForumLoading]     = useState(false);
+  const [forumError,   setForumError]       = useState<string | null>(null);
+  const [forumFetched, setForumFetched]     = useState(false);
+  const [searchResults, setSearchResults]   = useState<ForumPlugin[] | null>(null);
+  const [searchLoading, setSearchLoading]   = useState(false);
+
+  // ── ui state
+  const [forumSearch,         setForumSearch]         = useState("");
+  const [liveSearch,          setLiveSearch]           = useState("");   // debounced
+  const [forumSort,           setForumSort]            = useState<ForumSort>("downloads");
+  const [forumCategory,       setForumCategory]        = useState<ForumCategory>("plugins");
+  const [currentPage,         setCurrentPage]          = useState(1);
+  const [view,                setView]                 = useState<DiscoverView>("grid");
+  const [showFavoritesOnly,   setShowFavoritesOnly]    = useState(false);
+  const [showNotInstalled,    setShowNotInstalled]      = useState(false);
+  const [maxPages,            setMaxPages]             = useState(5);
+  const [activeTag,           setActiveTag]            = useState<string | null>(null);
+  const [downloadModal, setDownloadModal] = useState<{
+    plugin: ForumPlugin; options: DownloadOption[]; loading: boolean; error?: string;
+  } | null>(null);
+
+  // ── debounce live search (local filter, not API)
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleSearchChange = (val: string) => {
+    setForumSearch(val);
+    setCurrentPage(1);
+    if (!val.trim()) { setSearchResults(null); setLiveSearch(""); return; }
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => setLiveSearch(val), 300);
+  };
+
+  // ── fetch forum catalog
+  const loadForumPlugins = useCallback(async (forceRefresh = false, category?: ForumCategory, pages?: number) => {
+    const cat = category ?? forumCategory;
+    const mp  = pages ?? maxPages;
+    setForumLoading(true);
+    setForumError(null);
+    setSearchResults(null);
+    setActiveTag(null);
+    try {
+      const list = await invoke<ForumPlugin[]>("fetch_forum_plugins", {
+        category: cat,
+        forceRefresh,
+        maxPages: mp,
+      });
+      setForumPlugins(list);
+      setForumFetched(true);
+      setCurrentPage(1);
+    } catch (e) {
+      setForumError(String(e));
+      setForumPlugins(prev => prev.length > 0 ? prev : []);
+    } finally {
+      setForumLoading(false);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [forumCategory, maxPages]);
+
+  useEffect(() => { loadForumPlugins(false); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+
+  // ── API search
+  const searchForum = useCallback(async () => {
+    const q = forumSearch.trim();
+    if (!q) { setSearchResults(null); return; }
+    setSearchLoading(true);
+    setForumError(null);
+    try {
+      const list = await invoke<ForumPlugin[]>("search_forum_resources", { keywords: q });
+      setSearchResults(list);
+      setCurrentPage(1);
+    } catch (e) {
+      setForumError(String(e));
+      setSearchResults([]);
+    } finally {
+      setSearchLoading(false);
+    }
+  }, [forumSearch]);
+
+  // ── download modal
+  const openDownloadModal = useCallback(async (plugin: ForumPlugin) => {
+    if (readOnly) return;
+    setDownloadModal({ plugin, options: [], loading: true });
+    try {
+      const opts = await invoke<DownloadOption[]>("fetch_plugin_download_options", { resourceUrl: plugin.url });
+      setDownloadModal(m => m ? { ...m, options: opts, loading: false } : null);
+    } catch (e) {
+      setDownloadModal(m => m ? { ...m, options: [], loading: false, error: String(e) } : null);
+    }
+  }, [readOnly]);
+
+  // ── helpers
+  const isInstalled = useCallback((title: string) => {
+    const lower = title.toLowerCase();
+    return installedPluginNames.some(n =>
+      n.toLowerCase() === lower || lower.includes(n.toLowerCase()) || n.toLowerCase().includes(lower)
+    );
+  }, [installedPluginNames]);
+
+  // ── tag cloud from prefix field
+  const tagCloud = useMemo(() => {
+    const counts: Record<string, number> = {};
+    forumPlugins.forEach(p => { if (p.prefix) counts[p.prefix] = (counts[p.prefix] ?? 0) + 1; });
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 12);
+  }, [forumPlugins]);
+
+  // ── filtered + sorted list
+  const baseList = searchResults ?? forumPlugins;
+  const filtered = useMemo(() => {
+    let list = [...baseList];
+    const q = (searchResults === null ? liveSearch : "").toLowerCase().trim();
+    if (q) {
+      list = list.filter(p =>
+        p.title.toLowerCase().includes(q) ||
+        (p.author?.toLowerCase().includes(q) ?? false)
+      );
+    }
+    if (searchResults === null) {
+      if (showFavoritesOnly) {
+        const set = new Set(favorites);
+        list = list.filter(p => set.has(p.id));
+      }
+      if (activeTag) list = list.filter(p => p.prefix === activeTag);
+    }
+    if (showNotInstalled) list = list.filter(p => !isInstalled(p.title));
+    if (forumSort === "name")      list.sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: "base" }));
+    else if (forumSort === "downloads") list.sort((a, b) => (b.downloads ?? 0) - (a.downloads ?? 0));
+    else if (forumSort === "rating")    list.sort((a, b) => parseFloat(b.rating ?? "0") - parseFloat(a.rating ?? "0"));
+    else                                list.sort((a, b) => Number(b.id) - Number(a.id));
+    return list;
+  }, [baseList, liveSearch, searchResults, showFavoritesOnly, showNotInstalled, activeTag, favorites, forumSort, isInstalled]);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PLUGINS_PER_PAGE));
+  const paginated  = useMemo(() => {
+    const s = (currentPage - 1) * PLUGINS_PER_PAGE;
+    return filtered.slice(s, s + PLUGINS_PER_PAGE);
+  }, [filtered, currentPage]);
+
+  const isSearchMode = searchResults !== null;
+  const installedCount = useMemo(() => forumPlugins.filter(p => isInstalled(p.title)).length, [forumPlugins, isInstalled]);
+  const totalDownloads = useMemo(() => forumPlugins.reduce((s, p) => s + (p.downloads ?? 0), 0), [forumPlugins]);
+
+  // ── pagination helper
+  const pageNums = useMemo(() => {
+    return Array.from({ length: totalPages }, (_, i) => i + 1)
+      .reduce<(number | "…")[]>((acc, n, i, arr) => {
+        if (n === 1 || n === totalPages || Math.abs(n - currentPage) <= 2) {
+          if (i > 0 && typeof arr[i-1] === "number" && (n as number) - (arr[i-1] as number) > 1) acc.push("…");
+          acc.push(n);
+        }
+        return acc;
+      }, []);
+  }, [totalPages, currentPage]);
+
+  return (
+    <section className="dsc-page">
+      {toast && <div className="toast">{toast}</div>}
+
+      {/* ── Download modal ── */}
+      {downloadModal && (
+        <div className="modal-overlay" onClick={() => setDownloadModal(null)}>
+          <div className="dsc-modal" onClick={e => e.stopPropagation()}>
+            <div className="dsc-modal-head">
+              <div className="dsc-modal-icon">
+                {downloadModal.plugin.icon_url
+                  ? <img src={downloadModal.plugin.icon_url} alt="" />
+                  : <span className="dsc-modal-icon-placeholder"><i className="ti ti-puzzle" /></span>
+                }
+              </div>
+              <div className="dsc-modal-title-block">
+                <h3>{downloadModal.plugin.title}</h3>
+                {downloadModal.plugin.author && <span>{downloadModal.plugin.author}</span>}
+              </div>
+              <button type="button" className="dsc-modal-close" onClick={() => setDownloadModal(null)} aria-label="Close">
+                <i className="ti ti-x" />
+              </button>
+            </div>
+            <div className="dsc-modal-body">
+              {downloadModal.loading && <div className="dsc-loading-center"><div className="spinner" /><span>Fetching downloads…</span></div>}
+              {downloadModal.error && (
+                <div className="alert alert-error">
+                  {downloadModal.error}
+                  <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenPluginUrl(downloadModal.plugin.url)}>Open in browser</button>
+                </div>
+              )}
+              {!downloadModal.loading && !downloadModal.error && downloadModal.options.length === 0 && (
+                <div className="dsc-modal-nofiles">
+                  <i className="ti ti-file-off" />
+                  <span>No direct downloads found.</span>
+                  <button type="button" className="btn btn-outline btn-sm" onClick={() => onOpenPluginUrl(downloadModal.plugin.url)}>Open plugin page</button>
+                </div>
+              )}
+              {!downloadModal.loading && !downloadModal.error && downloadModal.options.length > 0 && (
+                <ul className="dsc-dl-list">
+                  {downloadModal.options.map((opt, i) => (
+                    <li key={i} className="dsc-dl-item">
+                      <div className="dsc-dl-info">
+                        <i className="ti ti-file-zip" />
+                        <div>
+                          <span className="dsc-dl-label">{opt.label}</span>
+                          {opt.size   && <span className="dsc-dl-meta">{opt.size}</span>}
+                          {opt.source && <span className="dsc-dl-meta">{opt.source}</span>}
+                        </div>
+                      </div>
+                      <button type="button" className="btn btn-primary btn-sm" onClick={async () => {
+                        try { await onInstallFromUrl(opt.url); setDownloadModal(null); } catch {}
+                      }}>
+                        <i className="ti ti-download" /> Install
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <div className="dsc-modal-foot">
+              <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenPluginUrl(downloadModal.plugin.url)}>
+                <i className="ti ti-external-link" /> View on forum
+              </button>
+            </div>
           </div>
         </div>
-        {backendLogError && (
-          <p className="alert alert-error">{backendLogError}</p>
-        )}
-        {logDir && (
-          <p className="empty-hint config-path">
-            {t.logPath}: <code>{logDir}</code>
-          </p>
-        )}
-        {backendLogLoading ? (
-          <div className="loading-state">
-            <div className="spinner" />
-            <span>{t.loading}</span>
+      )}
+
+      {/* ── Layout: sidebar + main ── */}
+      <div className="dsc-layout">
+
+        {/* ═══ SIDEBAR ═══ */}
+        <aside className="dsc-sidebar">
+
+          {/* search */}
+          <div className="dsc-sb-search">
+            <i className="ti ti-search dsc-sb-search-icon" />
+            <input
+              ref={searchInputRef}
+              type="search"
+              className="dsc-sb-search-input"
+              placeholder="Search…"
+              value={forumSearch}
+              onChange={e => handleSearchChange(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") searchForum(); }}
+              aria-label="Search OBS resources"
+            />
+            {forumSearch && (
+              <button type="button" className="dsc-sb-search-clear" onClick={() => { setForumSearch(""); setLiveSearch(""); setSearchResults(null); }} aria-label="Clear">
+                <i className="ti ti-x" />
+              </button>
+            )}
           </div>
-        ) : !backendLogError && backendLog?.trim() ? (
-          <pre className="logs-backend-content">{backendLog}</pre>
-        ) : !backendLogError ? (
-          <p className="empty-hint">{t.logEmpty}</p>
-        ) : null}
+          <button type="button" className="dsc-sb-search-btn" onClick={searchForum} disabled={!forumSearch.trim() || searchLoading || forumLoading}>
+            {searchLoading ? <><span className="dsc-btn-spinner" /> Searching…</> : <><i className="ti ti-search" /> Search on forum</>}
+          </button>
+
+          <div className="dsc-sb-divider" />
+
+          {/* categories */}
+          <p className="dsc-sb-label">Browse</p>
+          <nav className="dsc-sb-nav" aria-label="Categories">
+            {(["plugins","themes","tools","scripts"] as ForumCategory[]).map(cat => {
+              const m = SIDEBAR_CAT_META[cat];
+              const active = forumCategory === cat && !isSearchMode;
+              return (
+                <button
+                  key={cat}
+                  type="button"
+                  className={`dsc-sb-cat ${active ? "active" : ""}`}
+                  onClick={() => {
+                    setForumCategory(cat);
+                    setSearchResults(null);
+                    setForumSearch("");
+                    setLiveSearch("");
+                    setCurrentPage(1);
+                    setActiveTag(null);
+                    loadForumPlugins(false, cat);
+                  }}
+                  disabled={forumLoading}
+                  style={{ "--cat-color": m.color } as React.CSSProperties}
+                >
+                  <span className="dsc-sb-cat-dot" />
+                  <i className={`ti ${m.icon}`} />
+                  <span className="dsc-sb-cat-label">{m.label}</span>
+                  {!isSearchMode && forumCategory === cat && forumPlugins.length > 0 && (
+                    <span className="dsc-sb-cat-count">{forumPlugins.length.toLocaleString()}</span>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+
+          <div className="dsc-sb-divider" />
+
+          {/* filters */}
+          <p className="dsc-sb-label">Filters</p>
+          <div className="dsc-sb-filters">
+            <label className={`dsc-sb-toggle ${showFavoritesOnly ? "active" : ""}`}>
+              <input type="checkbox" checked={showFavoritesOnly} onChange={e => { setShowFavoritesOnly(e.target.checked); setCurrentPage(1); }} />
+              <i className="ti ti-heart" />
+              Favorites
+              {favorites.length > 0 && <span className="dsc-sb-cat-count">{favorites.length}</span>}
+            </label>
+            <label className={`dsc-sb-toggle ${showNotInstalled ? "active" : ""}`}>
+              <input type="checkbox" checked={showNotInstalled} onChange={e => { setShowNotInstalled(e.target.checked); setCurrentPage(1); }} />
+              <i className="ti ti-filter" />
+              Not installed
+            </label>
+          </div>
+
+          {/* tag cloud */}
+          {tagCloud.length > 0 && !isSearchMode && (
+            <>
+              <div className="dsc-sb-divider" />
+              <p className="dsc-sb-label">Tags</p>
+              <div className="dsc-sb-tags">
+                {tagCloud.map(([tag, count]) => (
+                  <button
+                    key={tag}
+                    type="button"
+                    className={`dsc-sb-tag ${activeTag === tag ? "active" : ""}`}
+                    onClick={() => { setActiveTag(activeTag === tag ? null : tag); setCurrentPage(1); }}
+                  >
+                    {tag}
+                    <span>{count}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+
+          <div className="dsc-sb-divider" />
+
+          {/* scrape depth */}
+          <p className="dsc-sb-label">Catalog depth</p>
+          <div className="dsc-sb-depth">
+            <div className="dsc-sb-depth-row">
+              <span className="dsc-sb-depth-val">{maxPages} page{maxPages > 1 ? "s" : ""}</span>
+              <span className="dsc-sb-depth-hint">~{maxPages * 20} resources</span>
+            </div>
+            <input
+              type="range"
+              min={1}
+              max={15}
+              value={maxPages}
+              onChange={e => setMaxPages(Number(e.target.value))}
+              className="dsc-sb-range"
+              aria-label="Max pages to scrape"
+            />
+            <div className="dsc-sb-depth-labels"><span>Faster</span><span>More results</span></div>
+            <button
+              type="button"
+              className="btn btn-primary btn-sm dsc-sb-load-btn"
+              onClick={() => loadForumPlugins(true, forumCategory, maxPages)}
+              disabled={forumLoading}
+            >
+              {forumLoading ? <><span className="dsc-btn-spinner" /> Loading…</> : <><i className="ti ti-refresh" /> Load catalog</>}
+            </button>
+          </div>
+
+          <div className="dsc-sb-divider" />
+
+          {/* quick links */}
+          <div className="dsc-sb-links">
+            <button type="button" className="dsc-sb-link" onClick={onOpenForum}>
+              <i className="ti ti-external-link" /> OBS Forum
+            </button>
+            <button type="button" className="dsc-sb-link" onClick={onTestForum}>
+              <i className="ti ti-wifi" /> Test connection
+            </button>
+          </div>
+        </aside>
+
+        {/* ═══ MAIN ═══ */}
+        <main className="dsc-main">
+
+          {/* ── stat bar ── */}
+          {forumFetched && !isSearchMode && (
+            <div className="dsc-statbar">
+              <div className="dsc-stat-item">
+                <span className="dsc-stat-num">{forumPlugins.length.toLocaleString()}</span>
+                <span className="dsc-stat-lbl">resources</span>
+              </div>
+              <div className="dsc-stat-sep" />
+              <div className="dsc-stat-item">
+                <span className="dsc-stat-num">{installedCount}</span>
+                <span className="dsc-stat-lbl">installed</span>
+              </div>
+              <div className="dsc-stat-sep" />
+              <div className="dsc-stat-item">
+                <span className="dsc-stat-num">
+                  {totalDownloads >= 1_000_000
+                    ? `${(totalDownloads / 1_000_000).toFixed(1)}M`
+                    : totalDownloads >= 1000
+                    ? `${(totalDownloads / 1000).toFixed(0)}k`
+                    : totalDownloads.toLocaleString()}
+                </span>
+                <span className="dsc-stat-lbl">total downloads</span>
+              </div>
+              <div className="dsc-stat-sep" />
+              <div className="dsc-stat-item">
+                <span className="dsc-stat-num">{SIDEBAR_CAT_META[forumCategory].label}</span>
+                <span className="dsc-stat-lbl">category</span>
+              </div>
+            </div>
+          )}
+
+          {/* ── error ── */}
+          {forumError && (
+            <div className="alert alert-error dsc-error-bar">
+              <i className="ti ti-alert-circle" />
+              <span>{forumError}</span>
+              <button type="button" className="btn btn-ghost btn-sm" onClick={() => loadForumPlugins(true)}>Retry</button>
+            </div>
+          )}
+
+          {/* ── search mode header ── */}
+          {isSearchMode && (
+            <div className="dsc-search-header">
+              <div className="dsc-search-tag">
+                <i className="ti ti-search" />
+                <span>Results for <strong>"{forumSearch}"</strong></span>
+                <span className="dsc-search-tag-count">{filtered.length} found</span>
+                <button type="button" className="dsc-tag-clear" onClick={() => { setSearchResults(null); setForumSearch(""); setLiveSearch(""); }} aria-label="Clear">
+                  <i className="ti ti-x" />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* ── toolbar ── */}
+          <div className="dsc-toolbar">
+            <span className="dsc-count">
+              {forumLoading
+                ? <><span className="dsc-loading-dot" /> Loading…</>
+                : <>{filtered.length.toLocaleString()} result{filtered.length !== 1 ? "s" : ""}{liveSearch && !isSearchMode ? ` for "${liveSearch}"` : ""}</>
+              }
+            </span>
+            <div className="dsc-toolbar-right">
+              {activeTag && (
+                <button type="button" className="dsc-active-tag" onClick={() => setActiveTag(null)}>
+                  <i className="ti ti-tag" /> {activeTag} <i className="ti ti-x" />
+                </button>
+              )}
+              <select className="dsc-sort-select" value={forumSort} onChange={e => { setForumSort(e.target.value as ForumSort); setCurrentPage(1); }} aria-label="Sort">
+                <option value="downloads">Most downloaded</option>
+                <option value="rating">Highest rated</option>
+                <option value="id">Most recent</option>
+                <option value="name">A → Z</option>
+              </select>
+              <div className="dsc-view-toggle" role="group" aria-label="View mode">
+                <button type="button" className={`dsc-view-btn ${view === "grid" ? "active" : ""}`} onClick={() => setView("grid")} title="Grid view" aria-pressed={view === "grid"}>
+                  <i className="ti ti-grid-dots" />
+                </button>
+                <button type="button" className={`dsc-view-btn ${view === "list" ? "active" : ""}`} onClick={() => setView("list")} title="List view" aria-pressed={view === "list"}>
+                  <i className="ti ti-list" />
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* ── skeleton loading (initial) ── */}
+          {forumLoading && !forumFetched && (
+            <div className={`dsc-grid dsc-grid--${view}`}>
+              {Array.from({ length: 12 }).map((_, i) => (
+                <div key={i} className={`dsc-skeleton ${view === "list" ? "dsc-skeleton--list" : ""}`}>
+                  <div className="dsc-skel-icon" />
+                  <div className="dsc-skel-lines">
+                    <div className="dsc-skel-line dsc-skel-title" />
+                    <div className="dsc-skel-line dsc-skel-sub" />
+                    <div className="dsc-skel-line dsc-skel-desc" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* ── empty ── */}
+          {!forumLoading && forumFetched && filtered.length === 0 && (
+            <div className="dsc-empty">
+              <i className="ti ti-mood-empty" />
+              <p>{isSearchMode ? `No results for "${forumSearch}"` : showFavoritesOnly ? "No favorites yet" : activeTag ? `No results for tag "${activeTag}"` : "No plugins found"}</p>
+              {isSearchMode && (
+                <button type="button" className="btn btn-outline btn-sm" onClick={() => {
+                  const url = `https://obsproject.com/forum/search/?type=resource&keywords=${encodeURIComponent(forumSearch)}`;
+                  invoke("open_url", { url });
+                }}>
+                  <i className="ti ti-external-link" /> Search on forum website
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* ── plugin cards ── */}
+          {(!forumLoading || forumFetched) && filtered.length > 0 && (
+            <ul className={`dsc-grid dsc-grid--${view}`} role="list">
+              {paginated.map(p => {
+                const installed = isInstalled(p.title);
+                const isFav    = favorites.includes(p.id);
+                if (view === "list") {
+                  return (
+                    <li key={p.id} className={`dsc-row ${installed ? "dsc-row--installed" : ""}`} role="listitem">
+                      <div className="dsc-row-icon">
+                        {p.icon_url
+                          ? <img src={p.icon_url} alt="" loading="lazy" />
+                          : <i className="ti ti-puzzle" />
+                        }
+                      </div>
+                      <div className="dsc-row-body">
+                        <div className="dsc-row-top">
+                          <h3 className="dsc-row-name">{p.title}</h3>
+                          {p.prefix && <span className="dsc-prefix">{p.prefix}</span>}
+                          {installed && <span className="dsc-badge-installed"><i className="ti ti-check" /> Installed</span>}
+                        </div>
+                        <div className="dsc-row-meta">
+                          {p.author && <span><i className="ti ti-user" /> {p.author}</span>}
+                          {p.version && <span>v{p.version}</span>}
+                          {p.downloads != null && <span><i className="ti ti-download" /> {p.downloads >= 1000 ? `${(p.downloads/1000).toFixed(1)}k` : p.downloads}</span>}
+                          {p.rating && <span className="dsc-stat--star"><i className="ti ti-star" /> {p.rating}{p.rating_count ? ` (${p.rating_count})` : ""}</span>}
+                          {p.updated && <span><i className="ti ti-clock" /> {p.updated}</span>}
+                        </div>
+                        {p.description && <p className="dsc-row-desc">{p.description}</p>}
+                      </div>
+                      <div className="dsc-row-actions">
+                        <button type="button" className={`dsc-fav-btn ${isFav ? "active" : ""}`} onClick={() => onToggleFavorite(p.id)} title={isFav ? "Unfavorite" : "Favorite"}>
+                          <i className={`ti ti-heart${isFav ? "-filled" : ""}`} />
+                        </button>
+                        {!readOnly && (
+                          <button type="button" className="btn btn-sm btn-primary" onClick={() => openDownloadModal(p)}>
+                            <i className="ti ti-download" /> {installed ? "Reinstall" : "Install"}
+                          </button>
+                        )}
+                        <button type="button" className="btn btn-sm btn-ghost" onClick={() => onOpenPluginUrl(p.url)} title="Forum page">
+                          <i className="ti ti-external-link" />
+                        </button>
+                      </div>
+                    </li>
+                  );
+                }
+                // grid card
+                return (
+                  <li key={p.id} className={`dsc-card ${installed ? "dsc-card--installed" : ""}`} role="listitem">
+                    <div className="dsc-card-head">
+                      <div className="dsc-card-icon">
+                        {p.icon_url ? <img src={p.icon_url} alt="" loading="lazy" /> : <i className="ti ti-puzzle" />}
+                      </div>
+                      <div className="dsc-card-title-wrap">
+                        <h3 className="dsc-card-name">{p.title}</h3>
+                        {p.author && <span className="dsc-card-author">{p.author}</span>}
+                      </div>
+                      <button type="button" className={`dsc-fav-btn ${isFav ? "active" : ""}`} onClick={() => onToggleFavorite(p.id)} title={isFav ? "Unfavorite" : "Favorite"}>
+                        <i className={`ti ti-heart${isFav ? "-filled" : ""}`} />
+                      </button>
+                    </div>
+                    {p.prefix && <span className="dsc-prefix">{p.prefix}</span>}
+                    {p.description && <p className="dsc-card-desc">{p.description}</p>}
+                    <div className="dsc-card-stats">
+                      {p.downloads != null && <span className="dsc-stat"><i className="ti ti-download" />{p.downloads >= 1000 ? `${(p.downloads/1000).toFixed(1)}k` : p.downloads}</span>}
+                      {p.rating && <span className="dsc-stat dsc-stat--star"><i className="ti ti-star" />{p.rating}</span>}
+                      {p.updated && <span className="dsc-stat"><i className="ti ti-clock" />{p.updated}</span>}
+                      {p.version && <span className="dsc-stat dsc-stat--version">v{p.version}</span>}
+                    </div>
+                    <div className="dsc-card-foot">
+                      {installed && <span className="dsc-badge-installed"><i className="ti ti-check" /> Installed</span>}
+                      {!readOnly && (
+                        <button type="button" className={`btn btn-sm ${installed ? "btn-outline" : "btn-primary"} dsc-install-btn`} onClick={() => openDownloadModal(p)}>
+                          <i className="ti ti-download" /> {installed ? "Reinstall" : "Install"}
+                        </button>
+                      )}
+                      <button type="button" className="btn btn-ghost btn-sm dsc-view-forum-btn" onClick={() => onOpenPluginUrl(p.url)} title="Forum page">
+                        <i className="ti ti-external-link" />
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
+          {/* ── pagination ── */}
+          {totalPages > 1 && (
+            <nav className="dsc-pagination" aria-label="Pagination">
+              <button type="button" className="dsc-page-btn" onClick={() => setCurrentPage(1)} disabled={currentPage <= 1} title="First page">
+                <i className="ti ti-chevrons-left" />
+              </button>
+              <button type="button" className="dsc-page-btn" onClick={() => setCurrentPage(p => Math.max(1, p-1))} disabled={currentPage <= 1} aria-label="Previous">
+                <i className="ti ti-chevron-left" />
+              </button>
+              {pageNums.map((item, i) =>
+                item === "…"
+                  ? <span key={`e${i}`} className="dsc-page-ellipsis">…</span>
+                  : <button key={item} type="button" className={`dsc-page-btn ${item === currentPage ? "active" : ""}`} onClick={() => setCurrentPage(item as number)} aria-current={item === currentPage ? "page" : undefined}>{item}</button>
+              )}
+              <button type="button" className="dsc-page-btn" onClick={() => setCurrentPage(p => Math.min(totalPages, p+1))} disabled={currentPage >= totalPages} aria-label="Next">
+                <i className="ti ti-chevron-right" />
+              </button>
+              <button type="button" className="dsc-page-btn" onClick={() => setCurrentPage(totalPages)} disabled={currentPage >= totalPages} title="Last page">
+                <i className="ti ti-chevrons-right" />
+              </button>
+              <span className="dsc-page-info">Page {currentPage} / {totalPages}</span>
+            </nav>
+          )}
+        </main>
       </div>
     </section>
   );
 }
 
 /**
- * Main App: routing (Home/Discover/Options/Logs), global state, Tauri IPC.
+ * Options page: custom paths, auto-backup, read-only, theme, export/import.
  */
+
+// ─────────────────────────────────────────────────────────────────────────
+// App
+// ─────────────────────────────────────────────────────────────────────────
 function App() {
   const [page, setPage] = useState<Page>("home");
   const [plugins, setPlugins] = useState<ObsPluginInfo[]>([]);
@@ -2024,92 +2351,73 @@ function App() {
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
 
-  const scrollToTop = () => {
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  };
+  const scrollToTop = () => window.scrollTo({ top: 0, behavior: "smooth" });
+
+  const NAV_ITEMS: { id: Page; icon: string; label: string }[] = [
+    { id: "home",     icon: "ti-home",        label: t.home     },
+    { id: "discover", icon: "ti-compass",     label: t.discover },
+    { id: "logs",     icon: "ti-list-check",  label: t.logs     },
+    { id: "options",  icon: "ti-settings",    label: t.options  },
+  ];
 
   return (
-    <main className="app" ref={contentRef}>
-      <header className="header">
-        <img src={logo} alt="LamaWorlds" className="header-logo" />
-        <div className="header-text">
-          <h1>LamaWorlds OBS Plugin Manager</h1>
-          <p className="subtitle">{t.subtitle}</p>
+    <div className="app-shell">
+      {/* ── Sidebar nav ── */}
+      <aside className="app-sidebar">
+        <div className="app-sidebar-logo">
+          <img src={logo} alt="LamaWorlds" className="app-sidebar-logo-img" />
+          <div className="app-sidebar-logo-text">
+            <span className="app-sidebar-brand">LamaWorlds</span>
+            <span className="app-sidebar-sub">OBS Plugin Manager</span>
+          </div>
         </div>
-        <button
-          type="button"
-          className="header-options-btn"
-          onClick={() => setPage("options")}
-          title={t.options}
-          aria-label={t.options}
-        >
-          ⚙
-        </button>
-      </header>
 
-      <nav className="nav-tabs" role="navigation" aria-label="Main navigation">
-        <button
-          type="button"
-          className={`nav-tab ${page === "home" ? "active" : ""}`}
-          onClick={() => setPage("home")}
-          aria-current={page === "home" ? "page" : undefined}
-          aria-label="Home"
-        >
-          {t.home}
-        </button>
-        <button
-          type="button"
-          className={`nav-tab ${page === "discover" ? "active" : ""}`}
-          onClick={() => setPage("discover")}
-          title={t.shortcuts}
-          aria-current={page === "discover" ? "page" : undefined}
-          aria-label="Discover"
-        >
-          {t.discover}
-        </button>
-        <button
-          type="button"
-          className={`nav-tab ${page === "logs" ? "active" : ""}`}
-          onClick={() => setPage("logs")}
-          aria-current={page === "logs" ? "page" : undefined}
-          aria-label="Logs"
-        >
-          {t.logs}
-        </button>
-      </nav>
-
-      {pluginUpdates.length > 0 && (
-        <div className="alert alert-warning plugin-updates-alert">
-          <strong>{t.updatesAvailable}:</strong>{" "}
-          {pluginUpdates.map((u) => (
-            <span key={u.plugin_name} className="plugin-update-item">
-              <span>{u.plugin_name}</span>
-              {u.installed_version && <span className="version-diff">v{u.installed_version} → v{u.available_version ?? "?"}</span>}
-              <button
-                type="button"
-                className="btn btn-sm btn-primary"
-                onClick={() => updatePluginFromForum(u)}
-                disabled={readOnly || updatingPlugins.has(u.plugin_name)}
-              >
-                {updatingPlugins.has(u.plugin_name) ? t.installing : t.updatePlugin}
-              </button>
-              <button type="button" className="btn btn-sm btn-outline" onClick={() => openPluginUrl(u.forum_url)}>
-                {t.viewOnForum}
-              </button>
-              <button type="button" className="btn btn-sm btn-primary" onClick={() => setPage("discover")}>
-                {t.viewInDiscover}
-              </button>
-            </span>
+        <nav className="app-sidebar-nav" aria-label="Main navigation">
+          {NAV_ITEMS.map(item => (
+            <button
+              key={item.id}
+              type="button"
+              className={`app-nav-item ${page === item.id ? "active" : ""}`}
+              onClick={() => setPage(item.id)}
+              aria-current={page === item.id ? "page" : undefined}
+            >
+              <i className={`ti ${item.icon} app-nav-icon`} aria-hidden="true" />
+              <span className="app-nav-label">{item.label}</span>
+              {item.id === "home" && pluginUpdates.length > 0 && (
+                <span className="app-nav-badge" title={`${pluginUpdates.length} update${pluginUpdates.length > 1 ? "s" : ""}`}>
+                  {pluginUpdates.length}
+                </span>
+              )}
+            </button>
           ))}
-        </div>
-      )}
-      {error && (
-        <div className="alert alert-error">
-          <span>{error}</span>
-        </div>
-      )}
+        </nav>
 
-      <div className={`content ${page === "discover" ? "content--discover" : ""}`}>
+        <div className="app-sidebar-bottom">
+          <div className="app-obs-status" title={obsRunning ? "OBS Studio is running" : "OBS Studio is not running"}>
+            <span className={`app-obs-dot ${obsRunning ? "app-obs-dot--on" : "app-obs-dot--off"}`} />
+            <span className="app-obs-label">OBS {obsRunning ? "running" : "not running"}</span>
+          </div>
+          {readOnly && (
+            <div className="app-readonly-badge">
+              <i className="ti ti-lock" /> Read-only
+            </div>
+          )}
+        </div>
+      </aside>
+
+      {/* ── Main content ── */}
+      <main className={`app-content ${page === "discover" ? "app-content--wide" : ""}`} ref={contentRef}>
+        {/* global error */}
+        {error && (
+          <div className="alert alert-error app-global-alert">
+            <i className="ti ti-alert-circle" />
+            <span>{error}</span>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setError(null)}>
+              <i className="ti ti-x" />
+            </button>
+          </div>
+        )}
+
         {page === "home" && (
           <HomePage
             plugins={plugins}
@@ -2153,7 +2461,7 @@ function App() {
         )}
         {page === "discover" && (
           <DiscoverPage
-            installedPluginNames={plugins.map((p) => p.name)}
+            installedPluginNames={plugins.map(p => p.name)}
             favorites={configData?.forum_favorites ?? []}
             searchInputRef={discoverSearchRef}
             onToggleFavorite={toggleFavorite}
@@ -2198,20 +2506,14 @@ function App() {
         {page === "logs" && (
           <LogsPage actionLog={actionLog} onOpenLog={openLogFolder} />
         )}
-      </div>
+      </main>
 
       {showScrollTop && (
-        <button
-          type="button"
-          className="scroll-top-btn"
-          onClick={scrollToTop}
-          aria-label="Scroll to top"
-          title="Scroll to top"
-        >
-          ↑
+        <button type="button" className="scroll-top-btn" onClick={scrollToTop} aria-label="Scroll to top">
+          <i className="ti ti-arrow-up" />
         </button>
       )}
-    </main>
+    </div>
   );
 }
 
