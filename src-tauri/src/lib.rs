@@ -158,6 +158,24 @@ struct ForumCache {
 
 const FORUM_CACHE_TTL_SECS: i64 = 20 * 60; // 20 minutes
 
+/// Shared User-Agent so the OBS forum / GitHub don't reject our requests.
+const HTTP_USER_AGENT: &str = "LamaWorlds-OBS-PluginManager/1.0 (Desktop; OBS Plugin Manager)";
+
+/// Builds a blocking HTTP client with a User-Agent and timeouts.
+///
+/// Without timeouts a stalled connection would block the worker thread (and the
+/// install/refresh UI) indefinitely. `connect_timeout` bounds DNS/TCP setup while
+/// `request_timeout_secs` bounds the whole exchange (use a larger value for big
+/// plugin downloads, a small one for HTML/API scraping).
+fn http_client(request_timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .user_agent(HTTP_USER_AGENT)
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(request_timeout_secs))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 fn load_forum_cache(category: &str) -> Option<Vec<ForumPlugin>> {
     let path = forum_cache_path(category);
     let s = std::fs::read_to_string(&path).ok()?;
@@ -1002,9 +1020,8 @@ fn install_plugin_from_url(url: String) -> Result<InstallFromPathResult, String>
     }
 
     let result = (|| -> Result<InstallFromPathResult, String> {
-        let client = reqwest::blocking::Client::builder()
-            .build()
-            .map_err(|e| e.to_string())?;
+        // Plugin archives can be tens of MB, so allow a generous request timeout.
+        let client = http_client(300)?;
 
         let response = client
             .get(&url)
@@ -1356,10 +1373,7 @@ fn fetch_forum_plugins_impl(
         }
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("LamaWorlds-OBS-PluginManager/1.0 (Desktop; OBS Plugin Manager)")
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_client(30)?;
 
     let mut by_id: HashMap<String, ForumPlugin> = HashMap::new();
     let pages = max_pages.max(1).min(5);
@@ -1393,10 +1407,7 @@ fn search_forum_resources(keywords: String) -> Result<Vec<ForumPlugin>, String> 
     if kw.is_empty() {
         return Ok(Vec::new());
     }
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("LamaWorlds-OBS-PluginManager/1.0 (Desktop; OBS Plugin Manager)")
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_client(30)?;
 
     let mut by_id: HashMap<String, ForumPlugin> = HashMap::new();
     for category in &["plugins", "themes", "tools", "scripts"] {
@@ -1482,10 +1493,7 @@ fn check_plugin_updates() -> Result<Vec<PluginUpdateInfo>, String> {
 /// Fetches available download options for a forum resource (forum files + GitHub releases).
 #[tauri::command]
 fn fetch_plugin_download_options(resource_url: String) -> Result<Vec<DownloadOption>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("LamaWorlds-OBS-PluginManager/1.0 (Desktop; OBS Plugin Manager)")
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_client(30)?;
 
     let mut options = Vec::new();
 
