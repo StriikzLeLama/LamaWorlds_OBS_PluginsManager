@@ -1,5 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import "@tabler/icons-webfont/dist/tabler-icons.min.css";
 import { ErrorBoundary } from "./ErrorBoundary";
 import App from "./App";
 

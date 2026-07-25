@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "tauri-applama-plugin-manager",
-  "version": "0.1.0",
+  "productName": "LamaWorlds OBS Plugin Manager",
+  "version": "0.2.0",
   "identifier": "com.lamaworlds.plugin-manager",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -14,11 +14,12 @@
     "windows": [
       {
         "title": "LamaWorlds OBS Plugin Manager",
-        "width": 800,
-        "height": 600,
-        "minWidth": 640,
-        "minHeight": 480,
-        "dragDropEnabled": true
+        "width": 1180,
+        "height": 780,
+        "minWidth": 720,
+        "minHeight": 520,
+        "dragDropEnabled": true,
+        "center": true
       }
     ],
     "security": {

@@ -1,6 +1,6 @@
 # LamaWorlds OBS Plugin Manager
 
-Tauri + React application for managing OBS Studio plugins.
+Tauri 2 + React 19 desktop app for managing OBS Studio plugins.
 
 ## Prerequisites
 
@@ -14,58 +14,67 @@ Tauri + React application for managing OBS Studio plugins.
 npm install
 ```
 
-## Running the application
+## Running
 
-### Development mode (recommended)
+### Development
 
 ```bash
 npm run tauri dev
 ```
 
-This command:
-1. Starts Vite (React frontend) on port 1420
-2. Builds the Rust backend
-3. Opens the application window with hot-reload
+Starts Vite on port 1420, builds the Rust backend, and opens the app with hot-reload.
 
 ### Production build
-
-To build the executable:
 
 ```bash
 npm run tauri build
 ```
 
-The installer will be generated in `src-tauri/target/release/bundle/`.
+Installer output: `src-tauri/target/release/bundle/`.
 
-### Alternative: Frontend only (without Tauri)
-
-To test the React frontend only (without Rust commands):
+### Frontend only (no Tauri)
 
 ```bash
 npm run dev
 ```
 
-Then open http://localhost:1420 — Tauri commands will not work in the browser.
+Open http://localhost:1420 — Rust commands will not work in the browser.
 
 ## Features
 
-- **Home**: List installed plugins, filters (All/Active/Disabled), search, sort, action history
-- **Discover**: OBS forum plugins with 2-column layout, featured plugins, pagination, favorites, install from URL
-- **Options**: Custom paths with validation
-- OBS folder detection (ProgramData, AppData, installation path)
-- Disable / enable plugins without uninstalling
-- Auto backup (.zip) before uninstall
-- Alert when OBS is running
-- Path validation on startup
-- Shortcuts: F5 (refresh), Ctrl+O (open folder)
+- **Home** — Installed plugins with search, filters, list/grid views, install from URL/file/drag-drop, export JSON/CSV, update detection
+- **Discover** — OBS forum catalog (plugins/themes/tools/scripts), favorites, tags, install via download modal
+- **Logs** — Session action timeline + backend `plugin-manager.log`
+- **Options** — Custom OBS paths, theme (dark/light/system), language (EN/FR), auto-backup, read-only mode, profiles, config import/export
+- OBS running detection and path validation
+- Collapsible sidebar, keyboard shortcuts
+
+### Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| F5 / Ctrl+R | Refresh |
+| Ctrl+F | Focus search |
+| Ctrl+O | Open plugins folder |
+| Ctrl+I | Import plugin file |
+| Ctrl+1–4 | Home / Discover / Options / Logs |
+| Ctrl+D | Discover |
+| Esc | Clear toast / error |
 
 ## Project structure
 
-- `src/` — React + TypeScript frontend
-- `src-tauri/` — Rust backend (Tauri)
-- `src-tauri/src/lib.rs` — Tauri commands (get_obs_paths, list_obs_plugins, etc.)
-- `src-tauri/icons/` — App icons (window, taskbar)
+```
+src/
+  App.tsx              # Shell, state, commands
+  pages/               # Home, Discover, Options, Logs
+  components/          # Shared UI (Toast)
+  types/               # Shared TypeScript types
+  i18n.ts              # EN / FR strings
+  App.css              # Theme + layout
+src-tauri/
+  src/lib.rs           # Tauri commands (filesystem, forum, install)
+```
 
 ## Icons
 
-To regenerate icons from your logo: `npx tauri icon public/logo_64x64.png`
+Regenerate from logo: `npx tauri icon public/logo_64x64.png`
