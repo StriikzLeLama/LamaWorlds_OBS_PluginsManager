@@ -1,10 +1,9 @@
 /**
- * LamaWorlds OBS Plugin Manager - Main UI
+ * App shell: sidebar navigation, page routing, and Tauri command orchestration.
  *
- * Manages OBS plugins: list, install from forum/URL, disable/enable, uninstall.
- * Pages: Home (plugins), Options (config), Discover (forum catalog).
+ * Pages keep UI only; this file owns plugin/config state and talks to the Rust backend.
  */
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke, openFolderDialog } from "./tauriApi";
 import { ask, save, open } from "@tauri-apps/plugin-dialog";
@@ -22,21 +21,31 @@ import type {
   StatusFilter,
   ViewMode,
 } from "./types";
-import { OBS_FORUM_PLUGINS_URL, MAX_ACTION_LOG } from "./types";
+import {
+  OBS_FORUM_PLUGINS_URL,
+  MAX_ACTION_LOG,
+  IMPORT_HISTORY_KEY,
+  MAX_IMPORT_HISTORY,
+  PATH_VALIDATE_DEBOUNCE_MS,
+  SIDEBAR_COLLAPSED_KEY,
+} from "./types";
 import { HomePage, OptionsPage, LogsPage, DiscoverPage } from "./pages";
 import { Toast } from "./components/Toast";
+import { useTheme } from "./hooks/useTheme";
+import { useToast } from "./hooks/useToast";
+import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
+import { readStorage, writeStorage, readJson } from "./utils/storage";
 import "./App.css";
 
 function App() {
   const [page, setPage] = useState<Page>("home");
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
-    try { return localStorage.getItem("sidebar-collapsed") === "1"; } catch { return false; }
-  });
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => readStorage(SIDEBAR_COLLAPSED_KEY) === "1",
+  );
   const [plugins, setPlugins] = useState<ObsPluginInfo[]>([]);
   const [paths, setPaths] = useState<ObsPaths | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [toast, setToast] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [sortBy, setSortBy] = useState<SortBy>("name");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
@@ -52,32 +61,39 @@ function App() {
   const [readOnly, setReadOnly] = useState(false);
   const [configPath, setConfigPath] = useState<string | null>(null);
   const [compactMode, setCompactMode] = useState(false);
-  // Theme: dark | light | system (system uses prefers-color-scheme)
-  const [theme, setTheme] = useState<"dark" | "light" | "system">(() => {
-    try {
-      const s = localStorage.getItem("theme");
-      if (s === "light" || s === "system") return s;
-      return "dark";
-    } catch { return "dark"; }
-  });
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [lang, setLangState] = useState<Lang>(getLang);
   const [pluginUpdates, setPluginUpdates] = useState<PluginUpdateInfo[]>([]);
   const [updatingPlugins, setUpdatingPlugins] = useState<Set<string>>(new Set());
-  const IMPORT_HISTORY_KEY = "obs-plugin-manager-import-history";
-  const MAX_IMPORT_HISTORY = 5;
-  const [importHistory, setImportHistory] = useState<string[]>(() => {
-    try {
-      const s = localStorage.getItem(IMPORT_HISTORY_KEY);
-      return s ? JSON.parse(s) : [];
-    } catch { return []; }
-  });
+  const [importHistory, setImportHistory] = useState<string[]>(() =>
+    readJson<string[]>(IMPORT_HISTORY_KEY, []),
+  );
   const [importLoading, setImportLoading] = useState(false);
+  /** Path of OBS's own modules.json; null when OBS is older than 32. */
+  const [obsModulesPath, setObsModulesPath] = useState<string | null>(null);
+
+  const { theme, setTheme } = useTheme();
+  const { toast, showToast, clearToast } = useToast();
+  const homeSearchRef = useRef<HTMLInputElement>(null);
+  const discoverSearchRef = useRef<HTMLInputElement>(null);
+
+  /**
+   * Run a Tauri/async action. `{ ok: false }` means the error banner was already set.
+   * Use this instead of comparing the payload to `undefined` — void commands return `null`.
+   */
+  const run = useCallback(async <T,>(fn: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false }> => {
+    try {
+      return { ok: true, value: await fn() };
+    } catch (e) {
+      setError(String(e));
+      return { ok: false };
+    }
+  }, []);
 
   const addToImportHistory = useCallback((path: string) => {
     setImportHistory((prev) => {
       const next = [path, ...prev.filter((p) => p !== path)].slice(0, MAX_IMPORT_HISTORY);
-      try { localStorage.setItem(IMPORT_HISTORY_KEY, JSON.stringify(next)); } catch {}
+      writeStorage(IMPORT_HISTORY_KEY, JSON.stringify(next));
       return next;
     });
   }, []);
@@ -95,11 +111,63 @@ function App() {
     setActionLog((prev) => [entry, ...prev].slice(0, MAX_ACTION_LOG));
   }, []);
 
+  const currentConfig = useCallback(
+    (): AppConfig => ({
+      custom_plugins_path: customPluginsPath.trim() || null,
+      custom_obs_install_path: customObsPath.trim() || null,
+      forum_favorites: configData?.forum_favorites ?? [],
+      auto_backup: autoBackup,
+      read_only: readOnly,
+    }),
+    [customPluginsPath, customObsPath, configData, autoBackup, readOnly],
+  );
+
+  /**
+   * Persists a Behavior switch straight away: those toggles sit in their own
+   * section with no Save button, so without this the backend keeps using the
+   * previous value and the UI silently disagrees with it.
+   *
+   * Built from the last saved config rather than the path inputs, which have
+   * their own Save button and may hold unsaved edits.
+   */
+  const persistBehavior = useCallback(
+    async (patch: { auto_backup?: boolean; read_only?: boolean }) => {
+      const base = configData;
+      const next: AppConfig = {
+        custom_plugins_path: base?.custom_plugins_path ?? null,
+        custom_obs_install_path: base?.custom_obs_install_path ?? null,
+        forum_favorites: base?.forum_favorites ?? [],
+        auto_backup: autoBackup,
+        read_only: readOnly,
+        ...patch,
+      };
+      const result = await run(() => invoke("set_config", { config: next }));
+      if (result.ok) setConfigData(next);
+    },
+    [configData, autoBackup, readOnly, run],
+  );
+
+  const handleAutoBackupChange = useCallback(
+    (value: boolean) => {
+      setAutoBackup(value);
+      void persistBehavior({ auto_backup: value });
+    },
+    [persistBehavior],
+  );
+
+  const handleReadOnlyChange = useCallback(
+    (value: boolean) => {
+      setReadOnly(value);
+      void persistBehavior({ read_only: value });
+    },
+    [persistBehavior],
+  );
+
   const loadData = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [pluginsList, pathsData, configData, obsRun, valid, cfgDir] =
+      const [pluginsList, pathsData, config, obsRun, valid, cfgDir, modulesPath] =
         await Promise.all([
           invoke<ObsPluginInfo[]>("list_obs_plugins"),
           invoke<ObsPaths>("get_obs_paths"),
@@ -107,15 +175,17 @@ function App() {
           invoke<boolean>("is_obs_running"),
           invoke<boolean>("check_paths_valid"),
           invoke<string | null>("get_config_dir").catch(() => null),
+          invoke<string | null>("get_obs_modules_path").catch(() => null),
         ]);
       setPlugins(pluginsList);
       setPaths(pathsData);
-      setConfigData(configData);
-      setAutoBackup(configData.auto_backup ?? true);
-      setReadOnly(configData.read_only ?? false);
+      setConfigData(config);
+      setAutoBackup(config.auto_backup ?? true);
+      setReadOnly(config.read_only ?? false);
       setConfigPath(cfgDir ?? null);
-      setCustomPluginsPath(configData.custom_plugins_path ?? "");
-      setCustomObsPath(configData.custom_obs_install_path ?? "");
+      setObsModulesPath(modulesPath ?? null);
+      setCustomPluginsPath(config.custom_plugins_path ?? "");
+      setCustomObsPath(config.custom_obs_install_path ?? "");
       setObsRunning(obsRun);
       setPathValid(valid);
       addAction("Refresh", undefined, `${pluginsList.length} plugins loaded`);
@@ -129,93 +199,56 @@ function App() {
   }, [addAction]);
 
   useEffect(() => {
-    loadData();
+    void loadData();
   }, [loadData]);
-
-  useEffect(() => {
-    const resolved = theme === "system"
-      ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
-      : theme;
-    document.documentElement.setAttribute("data-theme", resolved);
-    try { localStorage.setItem("theme", theme); } catch { /* ignore */ }
-  }, [theme]);
-  useEffect(() => {
-    if (theme !== "system") return;
-    const m = window.matchMedia("(prefers-color-scheme: dark)");
-    const handler = () => {
-      document.documentElement.setAttribute("data-theme", m.matches ? "dark" : "light");
-    };
-    m.addEventListener("change", handler);
-    return () => m.removeEventListener("change", handler);
-  }, [theme]);
 
   const checkPluginUpdates = useCallback(async () => {
     try {
-      const updates = await invoke<PluginUpdateInfo[]>("check_plugin_updates");
-      setPluginUpdates(updates);
-    } catch { setPluginUpdates([]); }
+      setPluginUpdates(await invoke<PluginUpdateInfo[]>("check_plugin_updates"));
+    } catch {
+      setPluginUpdates([]);
+    }
   }, []);
 
   useEffect(() => {
-    checkPluginUpdates();
+    void checkPluginUpdates();
   }, [checkPluginUpdates, plugins]);
 
+  // Debounced existence check for custom OBS paths typed in Options.
   useEffect(() => {
-    const validatePaths = async () => {
+    const validate = async () => {
       const errs: { plugins?: string; obs?: string } = {};
-      if (customPluginsPath.trim()) {
+      for (const [key, value] of [
+        ["plugins", customPluginsPath],
+        ["obs", customObsPath],
+      ] as const) {
+        if (!value.trim()) continue;
         try {
-          const ok = await invoke<boolean>("validate_path", {
-            path: customPluginsPath.trim(),
-          });
-          if (!ok) errs.plugins = t.pathDoesNotExist;
+          const ok = await invoke<boolean>("validate_path", { path: value.trim() });
+          if (!ok) errs[key] = t.pathDoesNotExist;
         } catch {
-          errs.plugins = t.unableToVerify;
-        }
-      }
-      if (customObsPath.trim()) {
-        try {
-          const ok = await invoke<boolean>("validate_path", {
-            path: customObsPath.trim(),
-          });
-          if (!ok) errs.obs = t.pathDoesNotExist;
-        } catch {
-          errs.obs = t.unableToVerify;
+          errs[key] = t.unableToVerify;
         }
       }
       setPathErrors(errs);
     };
-    const timeoutId = setTimeout(validatePaths, 400);
-    return () => clearTimeout(timeoutId);
+    const id = setTimeout(validate, PATH_VALIDATE_DEBOUNCE_MS);
+    return () => clearTimeout(id);
   }, [customPluginsPath, customObsPath, lang]);
-
-  const showToast = useCallback((msg: string) => {
-    setToast(msg);
-    setTimeout(() => setToast(null), 3000);
-  }, []);
 
   async function saveCustomPaths() {
     if (pathErrors.plugins || pathErrors.obs) return;
     setSaving(true);
     setError(null);
-    try {
-      await invoke("set_config", {
-        config: {
-          custom_plugins_path: customPluginsPath.trim() || null,
-          custom_obs_install_path: customObsPath.trim() || null,
-          forum_favorites: configData?.forum_favorites ?? [],
-          auto_backup: autoBackup,
-          read_only: readOnly,
-        },
-      });
+    const result = await run(async () => {
+      await invoke("set_config", { config: currentConfig() });
       await loadData();
+    });
+    if (result.ok) {
       addAction("Options saved");
       showToast(t.optionsSaved);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSaving(false);
     }
+    setSaving(false);
   }
 
   async function toggleFavorite(forumId: string) {
@@ -223,235 +256,195 @@ function App() {
     const next = current.includes(forumId)
       ? current.filter((id) => id !== forumId)
       : [...current, forumId];
-    try {
+    await run(async () => {
       await invoke("set_favorites", { ids: next });
       setConfigData((prev) => (prev ? { ...prev, forum_favorites: next } : null));
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function openLogFolder() {
-    try {
-      await invoke("open_log_folder");
-    } catch (e) {
-      setError(String(e));
-    }
+    });
   }
 
   async function exportFavoritesList() {
-    try {
-      const favs = configData?.forum_favorites ?? [];
-      const json = JSON.stringify({ favorites: favs, exportedAt: new Date().toISOString() }, null, 2);
-      const path = await save({ defaultPath: "obs-forum-favorites.json", filters: [{ name: "JSON", extensions: ["json"] }] });
-      if (path) {
-        await invoke("write_text_file", { path, contents: json });
-        addAction("Export favorites");
-        showToast(t.favoritesExported);
-      }
-    } catch (e) {
-      setError(String(e));
-    }
+    await run(async () => {
+      const json = JSON.stringify(
+        { favorites: configData?.forum_favorites ?? [], exportedAt: new Date().toISOString() },
+        null,
+        2,
+      );
+      const path = await save({
+        defaultPath: "obs-forum-favorites.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!path) return;
+      await invoke("write_text_file", { path, contents: json });
+      addAction("Export favorites");
+      showToast(t.favoritesExported);
+    });
   }
 
   async function importFavoritesList() {
-    try {
+    await run(async () => {
       const path = await open({ multiple: false, filters: [{ name: "JSON", extensions: ["json"] }] });
-      if (path && typeof path === "string") {
-        const contents = await invoke<string>("read_text_file", { path });
-        const data = JSON.parse(contents);
-        if (Array.isArray(data.favorites)) {
-          await invoke("set_favorites", { ids: data.favorites });
-          setConfigData((prev) => (prev ? { ...prev, forum_favorites: data.favorites } : null));
-          addAction("Import favorites");
-        showToast(t.favoritesImported);
-        }
-      }
-    } catch (e) {
-      setError(String(e));
-    }
+      if (!path || typeof path !== "string") return;
+      const contents = await invoke<string>("read_text_file", { path });
+      const data = JSON.parse(contents);
+      if (!Array.isArray(data.favorites)) return;
+      await invoke("set_favorites", { ids: data.favorites });
+      setConfigData((prev) => (prev ? { ...prev, forum_favorites: data.favorites } : null));
+      addAction("Import favorites");
+      showToast(t.favoritesImported);
+    });
   }
 
   async function browsePluginsFolder() {
-    try {
+    await run(async () => {
       const selected = await openFolderDialog("Select OBS plugins folder");
       if (selected) setCustomPluginsPath(selected);
-    } catch (e) {
-      setError(String(e));
-    }
+    });
   }
 
   async function browseObsFolder() {
-    try {
+    await run(async () => {
       const selected = await openFolderDialog("Select OBS folder");
       if (selected) setCustomObsPath(selected);
-    } catch (e) {
-      setError(String(e));
-    }
+    });
   }
 
   const openPluginsFolder = useCallback(async () => {
-    try {
-      await invoke("open_plugins_folder");
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
+    await run(() => invoke("open_plugins_folder"));
+  }, [run]);
 
-  const openPluginFolder = useCallback(async (path: string) => {
-    try {
-      await invoke("open_plugins_folder", { folderOverride: path });
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
+  const openPluginFolder = useCallback(
+    async (path: string) => {
+      await run(() => invoke("open_plugins_folder", { folderOverride: path }));
+    },
+    [run],
+  );
 
   async function testForumConnection() {
-    try {
+    await run(async () => {
       const result = await invoke<{ ok: boolean; count?: number; error?: string }>("test_forum_connection");
-      if (result.ok) {
-        showToast(t.forumOk(result.count ?? 0));
-      } else {
-        showToast(t.forumError(result.error ?? "unknown"));
-      }
-    } catch (e) {
-      setError(String(e));
-    }
+      showToast(result.ok ? t.forumOk(result.count ?? 0) : t.forumError(result.error ?? "unknown"));
+    });
   }
 
   async function openForum() {
-    try {
-      await invoke("open_url", { url: OBS_FORUM_PLUGINS_URL });
-    } catch (e) {
-      setError(String(e));
-    }
+    await run(() => invoke("open_url", { url: OBS_FORUM_PLUGINS_URL }));
   }
 
   async function openPluginUrl(url: string) {
-    try {
-      await invoke("open_url", { url });
-    } catch (e) {
-      setError(String(e));
-    }
+    await run(() => invoke("open_url", { url }));
   }
 
   async function disablePlugin(plugin: ObsPluginInfo) {
     if (!plugin.enabled) return;
-    try {
-      await invoke("disable_plugin", { pluginPath: plugin.uninstall_path });
-      addAction("Disabled", plugin.name, plugin.path);
-      showToast(t.disabledPlugin(plugin.name));
-      await loadData();
-    } catch (e) {
-      setError(String(e));
-    }
+    const result = await run(() => invoke("disable_plugin", { pluginPath: plugin.uninstall_path }));
+    if (!result.ok) return;
+    addAction("Disabled", plugin.name, plugin.path);
+    showToast(t.disabledPlugin(plugin.name));
+    await loadData();
   }
 
   async function enablePlugin(plugin: ObsPluginInfo) {
     if (plugin.enabled) return;
-    try {
-      await invoke("enable_plugin", { pluginPath: plugin.uninstall_path });
-      addAction("Enabled", plugin.name, plugin.path);
-      showToast(t.enabledPlugin(plugin.name));
-      await loadData();
-    } catch (e) {
-      setError(String(e));
-    }
+    const result = await run(() => invoke("enable_plugin", { pluginPath: plugin.uninstall_path }));
+    if (!result.ok) return;
+    addAction("Enabled", plugin.name, plugin.path);
+    showToast(t.enabledPlugin(plugin.name));
+    await loadData();
   }
 
   async function uninstallPlugin(plugin: ObsPluginInfo) {
-    let ok = false;
+    let confirmed = false;
     try {
-      ok = await ask(
-        t.confirmUninstall(plugin.name),
-        { title: t.confirm, kind: "warning" }
-      );
+      confirmed = await ask(t.confirmUninstall(plugin.name), { title: t.confirm, kind: "warning" });
     } catch {
-      ok = window.confirm(t.confirmUninstall(plugin.name));
+      confirmed = window.confirm(t.confirmUninstall(plugin.name));
     }
-    if (!ok) return;
-    try {
-      // Backup is handled by the Rust backend when auto_backup is enabled
-      await invoke("uninstall_plugin", { uninstallPath: plugin.uninstall_path });
-      addAction("Uninstalled", plugin.name, plugin.path);
-      showToast(t.uninstalledPlugin(plugin.name));
-      await loadData();
-    } catch (e) {
-      setError(String(e));
-    }
+    if (!confirmed) return;
+    // Backup is created by the Rust backend when auto_backup is enabled.
+    const result = await run(() => invoke("uninstall_plugin", { uninstallPath: plugin.uninstall_path }));
+    if (!result.ok) return;
+    addAction("Uninstalled", plugin.name, plugin.path);
+    showToast(t.uninstalledPlugin(plugin.name));
+    await loadData();
   }
 
   async function installFromUrl(url: string) {
-    try {
-      const res = await invoke<{ name: string; updated: boolean }>("install_plugin_from_url", { url });
-      addAction(res.updated ? "Updated" : "Installed", res.name, "from URL");
-      showToast(res.updated ? t.updatedPlugin(res.name) : t.installedPlugin(res.name));
-      await loadData();
-      await checkPluginUpdates();
-    } catch (e) {
-      setError(String(e));
-    }
+    const result = await run(() =>
+      invoke<{ name: string; updated: boolean }>("install_plugin_from_url", { url }),
+    );
+    if (!result.ok) return;
+    const res = result.value;
+    addAction(res.updated ? "Updated" : "Installed", res.name, "from URL");
+    showToast(res.updated ? t.updatedPlugin(res.name) : t.installedPlugin(res.name));
+    await loadData();
+    await checkPluginUpdates();
   }
 
-  const updatePluginFromForum = useCallback(async (update: PluginUpdateInfo) => {
-    if (readOnly) return;
-    try {
-      const running = await invoke<boolean>("is_obs_running");
-      if (running) {
-        setObsRunning(true);
-        setError(t.obsRunning);
-        return;
+  const updatePluginFromForum = useCallback(
+    async (update: PluginUpdateInfo) => {
+      if (readOnly) return;
+      try {
+        const running = await invoke<boolean>("is_obs_running");
+        if (running) {
+          setObsRunning(true);
+          setError(t.obsRunning);
+          return;
+        }
+      } catch {
+        if (obsRunning) {
+          setError(t.obsRunning);
+          return;
+        }
       }
-    } catch {
-      if (obsRunning) {
-        setError(t.obsRunning);
-        return;
+      setUpdatingPlugins((prev) => new Set(prev).add(update.plugin_name));
+      try {
+        const opts = await invoke<DownloadOption[]>("fetch_plugin_download_options", {
+          resourceUrl: update.forum_url,
+        });
+        const pick =
+          opts.find((o) => /\.zip(\?|$)/i.test(o.url) || o.label.toLowerCase().includes(".zip")) ??
+          opts[0];
+        if (!pick) {
+          setError(t.noDownloadFound(update.plugin_name));
+          return;
+        }
+        const res = await invoke<{ name: string; updated: boolean }>("install_plugin_from_url", {
+          url: pick.url,
+        });
+        addAction(res.updated ? "Updated" : "Installed", res.name, update.forum_url);
+        showToast(res.updated ? t.updatedPlugin(res.name) : t.installedPlugin(res.name));
+        await loadData();
+        await checkPluginUpdates();
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setUpdatingPlugins((prev) => {
+          const next = new Set(prev);
+          next.delete(update.plugin_name);
+          return next;
+        });
       }
-    }
-    setUpdatingPlugins((prev) => new Set(prev).add(update.plugin_name));
-    try {
-      const opts = await invoke<DownloadOption[]>("fetch_plugin_download_options", {
-        resourceUrl: update.forum_url,
-      });
-      const pick =
-        opts.find((o) => /\.zip(\?|$)/i.test(o.url) || o.label.toLowerCase().includes(".zip")) ??
-        opts[0];
-      if (!pick) {
-        setError(t.noDownloadFound(update.plugin_name));
-        return;
-      }
-      const res = await invoke<{ name: string; updated: boolean }>("install_plugin_from_url", {
-        url: pick.url,
-      });
-      addAction(res.updated ? "Updated" : "Installed", res.name, update.forum_url);
-      showToast(res.updated ? t.updatedPlugin(res.name) : t.installedPlugin(res.name));
-      await loadData();
-      await checkPluginUpdates();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setUpdatingPlugins((prev) => {
-        const next = new Set(prev);
-        next.delete(update.plugin_name);
-        return next;
-      });
-    }
-  }, [readOnly, obsRunning, addAction, showToast, loadData, checkPluginUpdates]);
+    },
+    [readOnly, obsRunning, addAction, showToast, loadData, checkPluginUpdates],
+  );
 
-  const installFromPath = useCallback(async (path: string) => {
-    try {
-      const res = await invoke<{ name: string; updated: boolean }>("install_plugin_from_path", { path });
+  const installFromPath = useCallback(
+    async (path: string) => {
+      const result = await run(() =>
+        invoke<{ name: string; updated: boolean }>("install_plugin_from_path", { path }),
+      );
+      if (!result.ok) return;
+      const res = result.value;
       addAction(res.updated ? "Updated" : "Installed", res.name, path);
       showToast(res.updated ? t.updatedPlugin(res.name) : t.installedPlugin(res.name));
       await loadData();
-    } catch (e) {
-      setError(String(e));
-    }
-  }, [addAction, showToast, loadData]);
+    },
+    [run, addAction, showToast, loadData],
+  );
 
   const importFromFile = useCallback(async () => {
     setImportLoading(true);
-    try {
+    await run(async () => {
       const selected = await open({
         multiple: true,
         filters: [
@@ -460,98 +453,100 @@ function App() {
         ],
       });
       const paths = selected
-        ? (Array.isArray(selected) ? selected : [selected]).filter((p): p is string => typeof p === "string")
+        ? (Array.isArray(selected) ? selected : [selected]).filter(
+            (p): p is string => typeof p === "string",
+          )
         : [];
       for (const p of paths) {
         await installFromPath(p);
         addToImportHistory(p);
       }
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setImportLoading(false);
-    }
-  }, [installFromPath, addToImportHistory]);
+    });
+    setImportLoading(false);
+  }, [run, installFromPath, addToImportHistory]);
 
-  const installFromPastePath = useCallback(async (pathInput: string) => {
-    const p = pathInput.trim().replace(/^["']|["']$/g, "");
-    if (!p) return;
-    setImportLoading(true);
-    try {
+  const installFromPastePath = useCallback(
+    async (pathInput: string) => {
+      const p = pathInput.trim().replace(/^["']|["']$/g, "");
+      if (!p) return;
+      setImportLoading(true);
       await installFromPath(p);
       addToImportHistory(p);
-    } catch (e) {
-      setError(String(e));
-    } finally {
       setImportLoading(false);
-    }
-  }, [installFromPath, addToImportHistory]);
+    },
+    [installFromPath, addToImportHistory],
+  );
 
   const openDownloads = useCallback(async () => {
-    try {
-      await invoke("open_downloads_folder");
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
+    await run(() => invoke("open_downloads_folder"));
+  }, [run]);
 
-  const reimportFromHistory = useCallback(async (path: string) => {
-    setImportLoading(true);
-    try {
+  const reimportFromHistory = useCallback(
+    async (path: string) => {
+      setImportLoading(true);
       await installFromPath(path);
-    } catch (e) {
-      setError(String(e));
-    } finally {
       setImportLoading(false);
-    }
-  }, [installFromPath]);
+    },
+    [installFromPath],
+  );
 
-  // Listen for drag-drop; cleanup on unmount (handle async listen promise)
   useEffect(() => {
     let unsub: (() => void) | undefined;
     let mounted = true;
     listen<{ paths?: string[] }>("tauri://drag-drop", (event) => {
-      const paths = event.payload?.paths;
-      if (paths?.length && !readOnly) {
-        paths.forEach((p) => installFromPath(p));
-      }
+      const dropped = event.payload?.paths;
+      if (!dropped?.length || readOnly) return;
+      // Sequential on purpose: each install mutates the same plugins folder and
+      // then refreshes the list, so running them in parallel interleaves both.
+      void (async () => {
+        setImportLoading(true);
+        try {
+          for (const droppedPath of dropped) {
+            await installFromPath(droppedPath);
+            addToImportHistory(droppedPath);
+          }
+        } finally {
+          setImportLoading(false);
+        }
+      })();
     }).then((u) => {
       unsub = u;
-      if (!mounted) u(); // Unmounted before listen resolved; unsubscribe immediately
+      if (!mounted) u();
     });
     return () => {
       mounted = false;
       unsub?.();
     };
-  }, [readOnly, installFromPath]);
+  }, [readOnly, installFromPath, addToImportHistory]);
 
   async function backupAllPlugins() {
-    try {
-      await invoke<string>("backup_all_plugins");
-      addAction("Backup all plugins");
-      showToast(t.backupAllDone);
-    } catch (e) {
-      setError(String(e));
-    }
+    const result = await run(() => invoke<string>("backup_all_plugins"));
+    if (!result.ok) return;
+    addAction("Backup all plugins");
+    showToast(t.backupAllDone);
   }
 
   async function saveProfile() {
-    try {
+    await run(async () => {
       const enabled = plugins.filter((p) => p.enabled).map((p) => p.name);
-      const json = JSON.stringify({ name: "Profile", enabled, exportedAt: new Date().toISOString() }, null, 2);
-      const path = await save({ defaultPath: "obs-plugin-profile.json", filters: [{ name: "JSON", extensions: ["json"] }] });
-      if (path) {
-        await invoke("write_text_file", { path, contents: json });
-        addAction("Profile saved", undefined, "obs-plugin-profile.json");
-        showToast(t.profileSaved);
-      }
-    } catch (e) {
-      setError(String(e));
-    }
+      const json = JSON.stringify(
+        { name: "Profile", enabled, exportedAt: new Date().toISOString() },
+        null,
+        2,
+      );
+      const path = await save({
+        defaultPath: "obs-plugin-profile.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!path) return;
+      await invoke("write_text_file", { path, contents: json });
+      addAction("Profile saved", undefined, "obs-plugin-profile.json");
+      showToast(t.profileSaved);
+    });
   }
 
   async function applyProfile() {
-    try {
+    await run(async () => {
       const path = await open({ multiple: false, filters: [{ name: "JSON", extensions: ["json"] }] });
       if (!path || typeof path !== "string") return;
       const contents = await invoke<string>("read_text_file", { path });
@@ -569,186 +564,144 @@ function App() {
         }
       }
       addAction("Profile applied", undefined, `${enabledNames.length} enabled`);
-        showToast(t.profileApplied);
+      showToast(t.profileApplied);
       await loadData();
-    } catch (e) {
-      setError(String(e));
-    }
+    });
   }
 
   async function exportConfig() {
-    try {
+    await run(async () => {
       const json = await invoke<string>("export_config_json");
       const path = await save({
         defaultPath: "obs-plugin-manager-backup.json",
         filters: [{ name: "JSON", extensions: ["json"] }],
       });
-      if (path) {
-        await invoke("write_text_file", { path, contents: json });
-        addAction("Config exported");
-        showToast(t.configExported);
-      }
-    } catch (e) {
-      setError(String(e));
-    }
+      if (!path) return;
+      await invoke("write_text_file", { path, contents: json });
+      addAction("Config exported");
+      showToast(t.configExported);
+    });
   }
 
   async function importConfig() {
-    try {
+    await run(async () => {
       const path = await open({
         multiple: false,
         filters: [{ name: "JSON", extensions: ["json"] }],
       });
-      if (path && typeof path === "string") {
-        const contents = await invoke<string>("read_text_file", { path });
-        const data = JSON.parse(contents);
-        if (data.config) {
-          await invoke("set_config", {
-            config: {
-              custom_plugins_path: data.config.custom_plugins_path ?? null,
-              custom_obs_install_path: data.config.custom_obs_install_path ?? null,
-              forum_favorites: data.config.forum_favorites ?? [],
-              auto_backup: data.config.auto_backup ?? true,
-              read_only: data.config.read_only ?? false,
-            },
-          });
-        }
-        addAction("Config imported", undefined, "Backup");
-        showToast(t.configImported);
-        await loadData();
+      if (!path || typeof path !== "string") return;
+      const contents = await invoke<string>("read_text_file", { path });
+      const data = JSON.parse(contents);
+      if (data.config) {
+        await invoke("set_config", {
+          config: {
+            custom_plugins_path: data.config.custom_plugins_path ?? null,
+            custom_obs_install_path: data.config.custom_obs_install_path ?? null,
+            forum_favorites: data.config.forum_favorites ?? [],
+            auto_backup: data.config.auto_backup ?? true,
+            read_only: data.config.read_only ?? false,
+          },
+        });
       }
-    } catch (e) {
-      setError(String(e));
-    }
+      addAction("Config imported", undefined, "Backup");
+      showToast(t.configImported);
+      await loadData();
+    });
   }
 
   async function exportPluginsJson() {
-    try {
+    await run(async () => {
       const json = await invoke<string>("export_plugins_list_json");
       const path = await save({
         defaultPath: "obs-plugins-list.json",
         filters: [{ name: "JSON", extensions: ["json"] }],
       });
-      if (path) {
-        await invoke("write_text_file", { path, contents: json });
-        addAction("Export list", undefined, "JSON");
-        showToast(t.listExported);
-      }
-    } catch (e) {
-      setError(String(e));
-    }
+      if (!path) return;
+      await invoke("write_text_file", { path, contents: json });
+      addAction("Export list", undefined, "JSON");
+      showToast(t.listExported);
+    });
   }
 
   async function exportPluginsCsv() {
-    try {
+    await run(async () => {
       const csv = await invoke<string>("export_plugins_list_csv");
       const path = await save({
         defaultPath: "obs-plugins-list.csv",
         filters: [{ name: "CSV", extensions: ["csv"] }],
       });
-      if (path) {
-        await invoke("write_text_file", { path, contents: csv });
-        addAction("Export list", undefined, "CSV");
-        showToast(t.listExportedCsv);
-      }
-    } catch (e) {
-      setError(String(e));
-    }
+      if (!path) return;
+      await invoke("write_text_file", { path, contents: csv });
+      addAction("Export list", undefined, "CSV");
+      showToast(t.listExportedCsv);
+    });
   }
 
-  const homeSearchRef = useRef<HTMLInputElement>(null);
-  const discoverSearchRef = useRef<HTMLInputElement>(null);
+  /**
+   * Flips a plugin in OBS's own plugin manager rather than renaming its folder,
+   * so the app and OBS agree. A plugin can ship several modules; all are set.
+   */
+  const setModuleEnabled = useCallback(
+    async (plugin: ObsPluginInfo, enabled: boolean) => {
+      const modules = plugin.module_names ?? [];
+      if (modules.length === 0) return;
+      const result = await run(async () => {
+        for (const moduleName of modules) {
+          await invoke("set_module_enabled", { moduleName, enabled });
+        }
+      });
+      if (!result.ok) return;
+      addAction(enabled ? "Enabled" : "Disabled", plugin.name, "OBS module list");
+      showToast(enabled ? t.enabledPlugin(plugin.name) : t.disabledPlugin(plugin.name));
+      await loadData();
+    },
+    [run, addAction, showToast, loadData],
+  );
 
-  // Global keyboard shortcuts
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setToast(null);
-        setError(null);
-        return;
-      }
-      if (e.ctrlKey && e.key === "r") {
-        e.preventDefault();
-        loadData();
-        return;
-      }
-      if (e.ctrlKey && e.key === "f") {
-        e.preventDefault();
-        if (page === "home") homeSearchRef.current?.focus();
-        else if (page === "discover") discoverSearchRef.current?.focus();
-        return;
-      }
-      if (e.key === "F5") {
-        e.preventDefault();
-        loadData();
-      }
-      if (e.ctrlKey && e.key === "o" && !e.shiftKey) {
-        e.preventDefault();
-        openPluginsFolder();
-      }
-      if (e.ctrlKey && e.key === "1") {
-        e.preventDefault();
-        setPage("home");
-      }
-      if (e.ctrlKey && e.key === "2") {
-        e.preventDefault();
-        setPage("discover");
-      }
-      if (e.ctrlKey && e.key === "3") {
-        e.preventDefault();
-        setPage("options");
-      }
-      if (e.ctrlKey && e.key === "4") {
-        e.preventDefault();
-        setPage("logs");
-      }
-      if (e.ctrlKey && e.key === "d") {
-        e.preventDefault();
-        setPage("discover");
-      }
-      if (e.ctrlKey && e.key === "i") {
-        e.preventDefault();
-        setPage("home");
-        importFromFile();
-      }
-      if (e.ctrlKey && e.shiftKey && e.key === "O") {
-        e.preventDefault();
-        setPage("options");
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [loadData, page, openPluginsFolder, importFromFile]);
+  const clearAlerts = useCallback(() => {
+    clearToast();
+    setError(null);
+  }, [clearToast]);
 
-  const contentRef = useRef<HTMLElement>(null);
+  const focusSearch = useCallback(() => {
+    if (page === "home") homeSearchRef.current?.focus();
+    else if (page === "discover") discoverSearchRef.current?.focus();
+  }, [page]);
+
+  useKeyboardShortcuts({
+    onRefresh: loadData,
+    onClearAlerts: clearAlerts,
+    onFocusSearch: focusSearch,
+    onOpenPluginsFolder: openPluginsFolder,
+    onImport: importFromFile,
+    onSetPage: setPage,
+  });
+
   const [showScrollTop, setShowScrollTop] = useState(false);
   useEffect(() => {
-    const onScroll = () => {
-      const y = window.scrollY ?? document.documentElement.scrollTop ?? 0;
-      setShowScrollTop(y > 200);
-    };
-    window.addEventListener("scroll", onScroll);
+    const onScroll = () => setShowScrollTop((window.scrollY ?? 0) > 200);
+    window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
-
-  const scrollToTop = () => window.scrollTo({ top: 0, behavior: "smooth" });
 
   const toggleSidebar = () => {
     setSidebarCollapsed((prev) => {
       const next = !prev;
-      try { localStorage.setItem("sidebar-collapsed", next ? "1" : "0"); } catch { /* ignore */ }
+      writeStorage(SIDEBAR_COLLAPSED_KEY, next ? "1" : "0");
       return next;
     });
   };
 
-  // lang in deps forces nav labels to refresh when language changes
-  const NAV_ITEMS: { id: Page; icon: string; label: string }[] = [
-    { id: "home",     icon: "ti-home",        label: t.home     },
-    { id: "discover", icon: "ti-compass",     label: t.discover },
-    { id: "logs",     icon: "ti-list-check",  label: t.logs     },
-    { id: "options",  icon: "ti-settings",    label: t.options  },
-  ];
-  void lang;
+  // `lang` is a dependency so nav labels refresh after setLang().
+  const navItems = useMemo(
+    () => [
+      { id: "home" as const, icon: "ti-home", label: t.home },
+      { id: "discover" as const, icon: "ti-compass", label: t.discover },
+      { id: "logs" as const, icon: "ti-list-check", label: t.logs },
+      { id: "options" as const, icon: "ti-settings", label: t.options },
+    ],
+    [lang],
+  );
 
   return (
     <div className={`app-shell ${sidebarCollapsed ? "app-shell--collapsed" : ""}`}>
@@ -762,7 +715,7 @@ function App() {
         </div>
 
         <nav className="app-sidebar-nav" aria-label="Main navigation">
-          {NAV_ITEMS.map(item => (
+          {navItems.map((item) => (
             <button
               key={item.id}
               type="button"
@@ -811,7 +764,7 @@ function App() {
         <Toast message={toast} />
       </div>
 
-      <main className={`app-content ${page === "discover" ? "app-content--wide" : ""}`} ref={contentRef}>
+      <main className={`app-content ${page === "discover" ? "app-content--wide" : ""}`}>
         {error && (
           <div className="alert alert-error app-global-alert">
             <i className="ti ti-alert-circle" />
@@ -860,11 +813,13 @@ function App() {
             pluginUpdates={pluginUpdates}
             onUpdatePlugin={updatePluginFromForum}
             updatingPlugins={updatingPlugins}
+            obsModulesAvailable={obsModulesPath !== null}
+            onSetModuleEnabled={setModuleEnabled}
           />
         )}
         {page === "discover" && (
           <DiscoverPage
-            installedPluginNames={plugins.map(p => p.name)}
+            installedPluginNames={plugins.map((p) => p.name)}
             favorites={configData?.forum_favorites ?? []}
             searchInputRef={discoverSearchRef}
             onToggleFavorite={toggleFavorite}
@@ -880,7 +835,7 @@ function App() {
             customPluginsPath={customPluginsPath}
             customObsPath={customObsPath}
             autoBackup={autoBackup}
-            onAutoBackupChange={setAutoBackup}
+            onAutoBackupChange={handleAutoBackupChange}
             saving={saving}
             pathErrors={pathErrors}
             onPluginsPathChange={setCustomPluginsPath}
@@ -891,9 +846,10 @@ function App() {
             onExport={exportConfig}
             onImport={importConfig}
             readOnly={readOnly}
-            onReadOnlyChange={setReadOnly}
+            onReadOnlyChange={handleReadOnlyChange}
             configPath={configPath}
-            onOpenLog={openLogFolder}
+            obsModulesPath={obsModulesPath}
+            onOpenLog={() => void run(() => invoke("open_log_folder"))}
             onExportFavorites={exportFavoritesList}
             onImportFavorites={importFavoritesList}
             onBackupAll={backupAllPlugins}
@@ -902,16 +858,24 @@ function App() {
             theme={theme}
             onThemeChange={setTheme}
             lang={lang}
-            onLangChange={(l) => { setLang(l); setLangState(l); }}
+            onLangChange={(l) => {
+              setLang(l);
+              setLangState(l);
+            }}
           />
         )}
         {page === "logs" && (
-          <LogsPage actionLog={actionLog} onOpenLog={openLogFolder} />
+          <LogsPage actionLog={actionLog} onOpenLog={() => void run(() => invoke("open_log_folder"))} />
         )}
       </main>
 
       {showScrollTop && (
-        <button type="button" className="scroll-top-btn" onClick={scrollToTop} aria-label={t.scrollToTop}>
+        <button
+          type="button"
+          className="scroll-top-btn"
+          onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+          aria-label={t.scrollToTop}
+        >
           <i className="ti ti-arrow-up" />
         </button>
       )}

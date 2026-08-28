@@ -1,7 +1,39 @@
+/**
+ * Options — theme, language, OBS paths, backups, profiles, and debug.
+ */
 import { t, type Lang } from "../i18n";
-// ─────────────────────────────────────────────────────────────────────────
-// Options Page
-// ─────────────────────────────────────────────────────────────────────────
+import type { ThemeMode } from "../types";
+
+export interface OptionsPageProps {
+  customPluginsPath: string;
+  customObsPath: string;
+  autoBackup: boolean;
+  onAutoBackupChange: (v: boolean) => void;
+  readOnly: boolean;
+  onReadOnlyChange: (v: boolean) => void;
+  configPath: string | null;
+  obsModulesPath: string | null;
+  saving: boolean;
+  pathErrors: { plugins?: string; obs?: string };
+  onPluginsPathChange: (v: string) => void;
+  onObsPathChange: (v: string) => void;
+  onBrowsePlugins: () => void;
+  onBrowseObs: () => void;
+  onSave: () => void;
+  onExport: () => void;
+  onImport: () => void;
+  onOpenLog: () => void;
+  onExportFavorites: () => void;
+  onImportFavorites: () => void;
+  onBackupAll: () => void;
+  onSaveProfile: () => void;
+  onApplyProfile: () => void;
+  theme: ThemeMode;
+  onThemeChange: (v: ThemeMode) => void;
+  lang: Lang;
+  onLangChange: (v: Lang) => void;
+}
+
 export function OptionsPage({
   customPluginsPath,
   customObsPath,
@@ -10,6 +42,7 @@ export function OptionsPage({
   readOnly,
   onReadOnlyChange,
   configPath,
+  obsModulesPath,
   saving,
   pathErrors,
   onPluginsPathChange,
@@ -29,34 +62,7 @@ export function OptionsPage({
   onThemeChange,
   lang,
   onLangChange,
-}: {
-  customPluginsPath: string;
-  customObsPath: string;
-  autoBackup: boolean;
-  onAutoBackupChange: (v: boolean) => void;
-  readOnly: boolean;
-  onReadOnlyChange: (v: boolean) => void;
-  configPath: string | null;
-  saving: boolean;
-  pathErrors: { plugins?: string; obs?: string };
-  onPluginsPathChange: (v: string) => void;
-  onObsPathChange: (v: string) => void;
-  onBrowsePlugins: () => void;
-  onBrowseObs: () => void;
-  onSave: () => void;
-  onExport: () => void;
-  onImport: () => void;
-  onOpenLog: () => void;
-  onExportFavorites: () => void;
-  onImportFavorites: () => void;
-  onBackupAll: () => void;
-  onSaveProfile: () => void;
-  onApplyProfile: () => void;
-  theme: "dark" | "light" | "system";
-  onThemeChange: (v: "dark" | "light" | "system") => void;
-  lang: Lang;
-  onLangChange: (v: Lang) => void;
-}) {
+}: OptionsPageProps) {
   return (
     <div className="opt-page">
       {/* ─── Appearance ─── */}
@@ -222,6 +228,10 @@ export function OptionsPage({
         <div className="opt-debug-row">
           <span className="opt-hint">{t.configPath}</span>
           <code className="opt-code">{configPath || "—"}</code>
+        </div>
+        <div className="opt-debug-row">
+          <span className="opt-hint">{t.obsModulesFile}</span>
+          <code className="opt-code">{obsModulesPath || t.obsModulesUnavailable}</code>
         </div>
         <button type="button" className="btn btn-ghost btn-sm" onClick={onOpenLog}>
           <i className="ti ti-folder-open" /> {t.openLog}

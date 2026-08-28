@@ -4,7 +4,10 @@ import "@tabler/icons-webfont/dist/tabler-icons.min.css";
 import { ErrorBoundary } from "./ErrorBoundary";
 import App from "./App";
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+const container = document.getElementById("root");
+if (!container) throw new Error('Root element "#root" not found in index.html');
+
+ReactDOM.createRoot(container).render(
   <React.StrictMode>
     <ErrorBoundary>
       <App />

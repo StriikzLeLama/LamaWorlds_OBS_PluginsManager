@@ -1,3 +1,4 @@
+/** Page components rendered by the App shell. */
 export { HomePage } from "./HomePage";
 export { OptionsPage } from "./OptionsPage";
 export { LogsPage } from "./LogsPage";

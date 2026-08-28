@@ -1,6 +1,6 @@
 /**
- * i18n for the OBS Plugin Manager UI.
- * Supports en and fr. Uses localStorage or system language.
+ * EN / FR strings. `t` is a Proxy so property access always reads the current
+ * language (localStorage, then OS locale). Call setLang() then re-render.
  */
 export type Lang = "en" | "fr";
 
@@ -22,6 +22,21 @@ const translations = {
     active: "Active",
     disabled: "Disabled",
     notInstalled: "Not installed",
+    obsModule: "OBS module",
+    builtInModule: "Not a plugin",
+    builtInHint:
+      "OBS does not list this as a plugin. It belongs to OBS itself or to another plugin — removing it will break them.",
+    obsTracked: "Tracked by OBS",
+    obsSaysEnabled: "OBS: enabled",
+    obsSaysDisabled: "OBS: disabled",
+    stateMismatch: "Out of sync with OBS",
+    stateMismatchHint:
+      "The folder on disk and OBS’s own plugin manager disagree. Use the OBS toggle so both match.",
+    enableInObs: "Enable in OBS",
+    disableInObs: "Disable in OBS",
+    obsModulesUnavailable: "Needs OBS Studio 32 or newer.",
+    onlyObsModules: "OBS plugins only",
+    obsModulesFile: "OBS module list",
     name: "Name",
     path: "Path",
     date: "Date",
@@ -236,6 +251,21 @@ const translations = {
     active: "Actifs",
     disabled: "Désactivés",
     notInstalled: "Non installés",
+    obsModule: "Module OBS",
+    builtInModule: "Pas un plugin",
+    builtInHint:
+      "OBS ne le liste pas comme plugin. Il appartient à OBS ou à un autre plugin — le supprimer les cassera.",
+    obsTracked: "Suivi par OBS",
+    obsSaysEnabled: "OBS : activé",
+    obsSaysDisabled: "OBS : désactivé",
+    stateMismatch: "Désynchronisé d’OBS",
+    stateMismatchHint:
+      "Le dossier sur le disque et le gestionnaire de plugins d’OBS ne concordent pas. Utilise le bouton OBS pour les aligner.",
+    enableInObs: "Activer dans OBS",
+    disableInObs: "Désactiver dans OBS",
+    obsModulesUnavailable: "Nécessite OBS Studio 32 ou plus récent.",
+    onlyObsModules: "Plugins OBS uniquement",
+    obsModulesFile: "Liste des modules OBS",
     name: "Nom",
     path: "Chemin",
     date: "Date",

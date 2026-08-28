@@ -10,7 +10,41 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use walkdir::WalkDir;
+
+/// Serializes every operation that mutates the plugin folders.
+///
+/// Commands are dispatched with `#[tauri::command(async)]`, so two installs (the
+/// drag-drop handler can start several at once) would otherwise extract into the
+/// same target directory concurrently and clobber each other's files.
+static PLUGIN_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Runs blocking work on the runtime's blocking pool and awaits the result.
+///
+/// A `#[tauri::command(async)]` on a sync function runs its body inside a task on
+/// a scheduler worker, which is an *entered* runtime context. That is fatal here:
+/// `reqwest::blocking` builds its own tokio runtime, and dropping a runtime from
+/// an async context panics with "Cannot drop a runtime in a context where
+/// blocking is not allowed". `spawn_blocking` threads never enter the runtime,
+/// so blocking - and that drop - is allowed there.
+async fn run_blocking<T, F>(func: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    match tauri::async_runtime::spawn_blocking(func).await {
+        Ok(result) => result,
+        Err(e) => Err(format!("Background task failed: {}", e)),
+    }
+}
+
+/// Acquires the mutation lock, recovering the guard if a previous holder panicked.
+fn lock_plugin_mutations() -> MutexGuard<'static, ()> {
+    PLUGIN_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Application configuration (paths, preferences).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -47,10 +81,12 @@ fn forum_cache_path(category: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("forum_cache.json"))
 }
 
+/// Append-only session log (`plugin-manager.log`) next to config.json.
 fn log_file_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("plugin-manager.log"))
 }
 
+/// Loads config.json, or defaults if missing / unreadable.
 fn load_config() -> AppConfig {
     let path = match config_path() {
         Some(p) if p.exists() => p,
@@ -62,6 +98,7 @@ fn load_config() -> AppConfig {
         .unwrap_or_default()
 }
 
+/// Persist config.json (creates the config directory if needed).
 fn save_config(config: &AppConfig) -> Result<(), String> {
     let path = config_path().ok_or("Could not determine config directory")?;
     if let Some(parent) = path.parent() {
@@ -82,6 +119,45 @@ pub struct ObsPluginInfo {
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modified_time: Option<i64>,
+    /// DLL stems this plugin ships. OBS identifies a module by its DLL stem, so
+    /// these are the keys used to look the plugin up in OBS's own modules.json.
+    #[serde(default)]
+    pub module_names: Vec<String>,
+    /// Enabled state as reported by OBS 32's plugin manager.
+    /// `None` when OBS does not track it (OBS < 32, or a built-in module).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obs_enabled: Option<bool>,
+    /// True when OBS lists this as a manageable module. Empirically OBS records
+    /// only user-installed modules there, so a DLL sitting in obs-plugins/64bit
+    /// without an entry is almost always one of OBS's own built-ins - which the
+    /// user must not uninstall.
+    #[serde(default)]
+    pub obs_managed: bool,
+    /// Friendly name OBS reports for the module, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obs_display_name: Option<String>,
+    /// Bare DLL that OBS does not list as a module: either one of OBS's own
+    /// built-ins (obs-ffmpeg, libcef, win-capture...) or a helper library owned
+    /// by another plugin (advanced-scene-switcher-lib). Neither is a plugin the
+    /// user should remove on its own, so the UI locks the destructive actions.
+    ///
+    /// Never set for folder plugins: a user plugin only reaches modules.json once
+    /// OBS has loaded it, so a freshly installed one must not be flagged.
+    #[serde(default)]
+    pub support_dll: bool,
+}
+
+/// One entry of OBS 32's own plugin manager state file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObsModuleInfo {
+    pub module_name: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub sources: Vec<String>,
 }
 
 /// Detected and configured OBS installation paths.
@@ -158,6 +234,10 @@ struct ForumCache {
 
 const FORUM_CACHE_TTL_SECS: i64 = 20 * 60; // 20 minutes
 
+/// Upper bound for a downloaded plugin archive, which is held in memory
+/// before extraction. Real OBS plugin packages are a few MB to ~100 MB.
+const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Shared User-Agent so the OBS forum / GitHub don't reject our requests.
 const HTTP_USER_AGENT: &str = "LamaWorlds-OBS-PluginManager/1.0 (Desktop; OBS Plugin Manager)";
 
@@ -203,6 +283,7 @@ fn save_forum_cache(category: &str, plugins: &[ForumPlugin]) {
     }
 }
 
+/// Append a timestamped line to plugin-manager.log (best-effort, never panics).
 fn log_action(message: &str) {
     if let Some(path) = log_file_path() {
         if let Some(parent) = path.parent() {
@@ -220,6 +301,7 @@ fn log_action(message: &str) {
     }
 }
 
+/// Maps Windows ERROR_ACCESS_DENIED (5) to a hint about closing OBS / admin rights.
 fn format_io_error(e: std::io::Error, context: &str) -> String {
     #[cfg(windows)]
     if e.raw_os_error() == Some(5) {
@@ -232,6 +314,7 @@ fn format_io_error(e: std::io::Error, context: &str) -> String {
     format!("{context}: {e}")
 }
 
+/// Blocks install/uninstall while OBS holds plugin DLLs open.
 fn ensure_obs_not_running() -> Result<(), String> {
     if is_obs_running() {
         return Err(
@@ -242,6 +325,7 @@ fn ensure_obs_not_running() -> Result<(), String> {
     Ok(())
 }
 
+/// Probe-write a temp file to know whether we can create a backup next to the plugin.
 fn can_write_to_dir(dir: Option<&Path>) -> bool {
     let dir = match dir {
         Some(d) if d.exists() => d,
@@ -292,7 +376,7 @@ fn remove_installed_plugin_by_name(plugin_name: &str) -> Result<bool, String> {
         }
         was_update = true;
         if load_config().auto_backup && path.is_dir() && can_write_to_dir(path.parent()) {
-            let _ = backup_plugin_folder(p.uninstall_path.clone());
+            let _ = backup_plugin_folder_inner(p.uninstall_path.clone());
         }
         if path.is_dir() {
             remove_dir_all_recursive(path)?;
@@ -315,6 +399,7 @@ fn get_app_data_path() -> PathBuf {
         .into()
 }
 
+/// Best-effort version from data/<name>.json, package.json, or manifest.json.
 fn try_read_plugin_version(plugin_path: &Path, plugin_name: &str) -> Option<String> {
     let data_json = plugin_path.join("data").join(format!("{}.json", plugin_name));
     if data_json.exists() {
@@ -350,8 +435,122 @@ fn get_modified_time(path: &Path) -> Option<i64> {
         .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
 }
 
+/// Root of OBS Studio's own configuration directory.
+///
+/// A portable install keeps it next to the executable in `config/obs-studio`;
+/// a normal install uses `%APPDATA%/obs-studio`.
+fn obs_config_dir() -> Option<PathBuf> {
+    let paths = get_obs_paths();
+    for obs in [
+        paths.custom_obs_install_path.as_deref(),
+        paths.obs_install_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let portable = Path::new(obs).join("config").join("obs-studio");
+        if portable.is_dir() {
+            return Some(portable);
+        }
+    }
+    let app_data = get_app_data_path();
+    let standard = app_data.join("obs-studio");
+    standard.is_dir().then_some(standard)
+}
+
+/// Path to OBS 32's plugin manager state file.
+fn obs_modules_json_path() -> Option<PathBuf> {
+    obs_config_dir().map(|d| d.join("plugin_manager").join("modules.json"))
+}
+
+/// Reads OBS's module list. Returns an empty vec when the file is absent,
+/// which is the normal case on OBS releases older than 32.
+fn load_obs_modules() -> Vec<ObsModuleInfo> {
+    let path = match obs_modules_json_path() {
+        Some(p) if p.is_file() => p,
+        _ => return Vec::new(),
+    };
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    serde_json::from_str::<Vec<ObsModuleInfo>>(&raw).unwrap_or_default()
+}
+
+/// The DLL stems a plugin provides, i.e. the names OBS uses to identify modules.
+///
+/// A folder plugin can ship several DLLs (a main module plus helper libraries);
+/// only those OBS actually lists as modules end up matching.
+fn module_names_for(path: &Path) -> Vec<String> {
+    if path.is_file() {
+        let stem = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.trim_end_matches(".disabled"))
+            .and_then(|n| n.strip_suffix(".dll"))
+            .unwrap_or_default();
+        return if stem.is_empty() {
+            Vec::new()
+        } else {
+            vec![stem.to_string()]
+        };
+    }
+    let bin_64 = path.join("bin").join("64bit");
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(&bin_64).into_iter().flatten().flatten() {
+        let file = entry.path();
+        if file.extension().is_some_and(|ext| ext == "dll") {
+            if let Some(stem) = file.file_stem().and_then(|s| s.to_str()) {
+                names.push(stem.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Annotates plugins with the state OBS itself reports for their modules.
+fn annotate_with_obs_modules(plugins: &mut [ObsPluginInfo]) {
+    apply_module_states(plugins, &load_obs_modules());
+}
+
+/// Pure matching step of [`annotate_with_obs_modules`].
+fn apply_module_states(plugins: &mut [ObsPluginInfo], modules: &[ObsModuleInfo]) {
+    if modules.is_empty() {
+        return;
+    }
+    let by_name: HashMap<&str, &ObsModuleInfo> = modules
+        .iter()
+        .map(|m| (m.module_name.as_str(), m))
+        .collect();
+    for plugin in plugins.iter_mut() {
+        let matched: Vec<&&ObsModuleInfo> = plugin
+            .module_names
+            .iter()
+            .filter_map(|n| by_name.get(n.as_str()))
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        plugin.obs_managed = true;
+        // A plugin counts as enabled for OBS only if every module it ships is.
+        plugin.obs_enabled = Some(matched.iter().all(|m| m.enabled));
+        plugin.obs_display_name = matched
+            .iter()
+            .find_map(|m| m.display_name.clone().filter(|s| !s.is_empty()));
+    }
+
+    for plugin in plugins.iter_mut() {
+        let is_bare_dll = plugin
+            .uninstall_path
+            .trim_end_matches(".disabled")
+            .to_ascii_lowercase()
+            .ends_with(".dll");
+        plugin.support_dll = is_bare_dll && !plugin.obs_managed;
+    }
+}
+
 /// Returns detected and configured OBS paths (plugins, install, AppData).
-#[tauri::command]
+#[tauri::command(async)]
 fn get_obs_paths() -> ObsPaths {
     let config = load_config();
     let program_data = get_program_data_path();
@@ -373,19 +572,19 @@ fn get_obs_paths() -> ObsPaths {
 }
 
 /// Returns the current application configuration.
-#[tauri::command]
+#[tauri::command(async)]
 fn get_config() -> AppConfig {
     load_config()
 }
 
 /// Saves the application configuration.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_config(config: AppConfig) -> Result<(), String> {
     save_config(&config)
 }
 
 /// Validates that a path exists and is a directory. Empty path returns true (no path set).
-#[tauri::command]
+#[tauri::command(async)]
 fn validate_path(path: String) -> Result<bool, String> {
     if path.trim().is_empty() {
         return Ok(true);
@@ -401,6 +600,7 @@ fn path_under_base(path: &Path, base: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Install target: custom path, then ProgramData, AppData, then OBS/data/plugins.
 fn get_target_plugins_dir() -> Result<PathBuf, String> {
     let paths = get_obs_paths();
     // 1. Custom plugins path (user-configured)
@@ -458,6 +658,8 @@ fn is_path_in_plugin_dirs(path: &Path) -> bool {
         .any(|base| path_under_base(path, &base))
 }
 
+/// Scan a `plugins/` tree: each folder with `bin/64bit/*.dll` is one plugin.
+/// Folders ending in `.disabled` are listed as disabled.
 fn find_plugins_in_directory(path: &Path) -> Vec<ObsPluginInfo> {
     let mut plugins = Vec::new();
 
@@ -487,13 +689,14 @@ fn find_plugins_in_directory(path: &Path) -> Vec<ObsPluginInfo> {
                 let has_dll = std::fs::read_dir(&bin_64)
                     .map(|d| {
                         d.filter_map(|e| e.ok()).any(|e| {
-                            e.path().extension().map_or(false, |ext| ext == "dll")
+                            e.path().extension().is_some_and(|ext| ext == "dll")
                         })
                     })
                     .unwrap_or(false);
                 if has_dll {
                     let version = try_read_plugin_version(&entry_path, &plugin_name);
                     let modified_time = get_modified_time(&entry_path);
+                    let module_names = module_names_for(&entry_path);
                     plugins.push(ObsPluginInfo {
                         name: plugin_name,
                         path: entry_path.to_string_lossy().to_string(),
@@ -501,6 +704,11 @@ fn find_plugins_in_directory(path: &Path) -> Vec<ObsPluginInfo> {
                         enabled,
                         version,
                         modified_time,
+                        module_names,
+                        obs_enabled: None,
+                        obs_managed: false,
+                        obs_display_name: None,
+                        support_dll: false,
                     });
                 }
             }
@@ -510,6 +718,7 @@ fn find_plugins_in_directory(path: &Path) -> Vec<ObsPluginInfo> {
     plugins
 }
 
+/// Scan legacy `obs-plugins/64bit/*.dll` (and `*.dll.disabled`).
 fn find_plugins_in_obs_plugins(path: &Path) -> Vec<ObsPluginInfo> {
     let mut plugins = Vec::new();
     let bin_64 = path.join("64bit");
@@ -521,13 +730,14 @@ fn find_plugins_in_obs_plugins(path: &Path) -> Vec<ObsPluginInfo> {
         let fname = entry_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let (enabled, plugin_name) = if fname.ends_with(".dll.disabled") {
             (false, fname.strip_suffix(".dll.disabled").unwrap_or(fname).to_string())
-        } else if entry_path.extension().map_or(false, |ext| ext == "dll") {
+        } else if entry_path.extension().is_some_and(|ext| ext == "dll") {
             (true, entry_path.file_stem().and_then(|n| n.to_str()).unwrap_or("").to_string())
         } else {
             continue;
         };
         if !plugin_name.is_empty() {
             let modified_time = get_modified_time(&entry_path);
+            let module_names = module_names_for(&entry_path);
             plugins.push(ObsPluginInfo {
                 name: plugin_name,
                 path: bin_64.to_string_lossy().to_string(),
@@ -535,6 +745,11 @@ fn find_plugins_in_obs_plugins(path: &Path) -> Vec<ObsPluginInfo> {
                 enabled,
                 version: None,
                 modified_time,
+                module_names,
+                obs_enabled: None,
+                obs_managed: false,
+                obs_display_name: None,
+                support_dll: false,
             });
         }
     }
@@ -542,7 +757,7 @@ fn find_plugins_in_obs_plugins(path: &Path) -> Vec<ObsPluginInfo> {
 }
 
 /// Scans configured OBS plugin folders and returns all installed plugins (including disabled .dll.disabled).
-#[tauri::command]
+#[tauri::command(async)]
 fn list_obs_plugins() -> Vec<ObsPluginInfo> {
     let mut all_plugins = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
@@ -561,13 +776,11 @@ fn list_obs_plugins() -> Vec<ObsPluginInfo> {
         plugin_paths.push(Some(Path::new(obs).join("data").join("plugins").to_string_lossy().to_string()));
     }
 
-    for path_opt in plugin_paths {
-        if let Some(path_str) = path_opt {
-            let path = Path::new(&path_str);
-            for plugin in find_plugins_in_directory(path) {
-                if seen_names.insert(plugin.name.clone()) {
-                    all_plugins.push(plugin);
-                }
+    for path_str in plugin_paths.into_iter().flatten() {
+        let path = Path::new(&path_str);
+        for plugin in find_plugins_in_directory(path) {
+            if seen_names.insert(plugin.name.clone()) {
+                all_plugins.push(plugin);
             }
         }
     }
@@ -576,18 +789,17 @@ fn list_obs_plugins() -> Vec<ObsPluginInfo> {
         custom_obs,
         obs_install,
     ];
-    for obs_path_opt in obs_paths {
-        if let Some(obs_path) = obs_path_opt {
-            let obs_plugins = Path::new(&obs_path).join("obs-plugins");
-            for plugin in find_plugins_in_obs_plugins(&obs_plugins) {
-                if seen_names.insert(plugin.name.clone()) {
-                    all_plugins.push(plugin);
-                }
+    for obs_path in obs_paths.into_iter().flatten() {
+        let obs_plugins = Path::new(&obs_path).join("obs-plugins");
+        for plugin in find_plugins_in_obs_plugins(&obs_plugins) {
+            if seen_names.insert(plugin.name.clone()) {
+                all_plugins.push(plugin);
             }
         }
     }
 
-    all_plugins.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    annotate_with_obs_modules(&mut all_plugins);
+    all_plugins.sort_by_key(|a| a.name.to_lowercase());
     all_plugins
 }
 
@@ -601,12 +813,20 @@ fn remove_dir_all_recursive(p: &Path) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
+/// Windows: `tasklist` for obs64/obs32/obs.exe. Other OS: always false.
+#[tauri::command(async)]
 fn is_obs_running() -> bool {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         use std::process::Command;
-        let output = Command::new("tasklist").output().ok();
+        // CREATE_NO_WINDOW: without it every poll flashes a console window in a
+        // release build (windows_subsystem = "windows"), and this runs on every refresh.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let output = Command::new("tasklist")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok();
         if let Some(ok) = output {
             let stdout = String::from_utf8_lossy(&ok.stdout).to_lowercase();
             ["obs64.exe", "obs32.exe", "obs.exe"]
@@ -622,8 +842,34 @@ fn is_obs_running() -> bool {
     }
 }
 
-#[tauri::command]
-fn backup_plugin_folder(plugin_path: String) -> Result<String, String> {
+/// Zip every file under `src` into `zip_path`.
+/// Stored (no deflate): plugin binaries barely compress and backups stay fast.
+fn zip_directory(src: &Path, zip_path: &Path) -> Result<(), String> {
+    let file = File::create(zip_path).map_err(|e| e.to_string())?;
+    let mut zip_writer = zip::ZipWriter::new(BufWriter::new(file));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+    for entry in WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name_in_zip = path.strip_prefix(src).unwrap_or(path);
+        let name_str = name_in_zip.to_string_lossy().replace('\\', "/");
+        zip_writer
+            .start_file(&name_str, options)
+            .map_err(|e| e.to_string())?;
+        let mut f = File::open(path).map_err(|e| e.to_string())?;
+        std::io::copy(&mut f, &mut zip_writer).map_err(|e| e.to_string())?;
+    }
+    zip_writer.finish().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Backup a single plugin folder next to it (`<name>-backup.zip`).
+///
+/// Lock-free: callers that already hold [`lock_plugin_mutations`] use this directly.
+fn backup_plugin_folder_inner(plugin_path: String) -> Result<String, String> {
     let src = Path::new(&plugin_path);
     if !src.exists() || !src.is_dir() {
         return Err("Plugin folder not found.".to_string());
@@ -634,29 +880,29 @@ fn backup_plugin_folder(plugin_path: String) -> Result<String, String> {
     let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("plugin");
     let parent = src.parent().ok_or("Invalid path.")?;
     let zip_path = parent.join(format!("{}-backup.zip", name));
-    let file = File::create(&zip_path).map_err(|e| e.to_string())?;
-    let mut zip_writer = zip::ZipWriter::new(BufWriter::new(file));
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
-    for entry in WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_file() {
-            let name_in_zip = path.strip_prefix(src).unwrap_or(path);
-            let name_str = name_in_zip.to_string_lossy().replace('\\', "/");
-            zip_writer
-                .start_file(&name_str, options)
-                .map_err(|e| e.to_string())?;
-            let mut f = File::open(path).map_err(|e| e.to_string())?;
-            std::io::copy(&mut f, &mut zip_writer).map_err(|e| e.to_string())?;
-        }
-    }
-    zip_writer.finish().map_err(|e| e.to_string())?;
+    zip_directory(src, &zip_path)?;
     Ok(zip_path.to_string_lossy().to_string())
 }
 
-/// Backs up the entire plugins folder to a .zip file.
+/// Backup a single plugin folder next to it (`<name>-backup.zip`).
 #[tauri::command]
-fn backup_all_plugins() -> Result<String, String> {
+async fn backup_plugin_folder(plugin_path: String) -> Result<String, String> {
+    run_blocking(move || backup_plugin_folder_sync(plugin_path)).await
+}
+
+fn backup_plugin_folder_sync(plugin_path: String) -> Result<String, String> {
+    let _guard = lock_plugin_mutations();
+    backup_plugin_folder_inner(plugin_path)
+}
+
+/// Backup the entire plugins folder (`obs-plugins-backup-<timestamp>.zip`).
+#[tauri::command]
+async fn backup_all_plugins() -> Result<String, String> {
+    run_blocking(backup_all_plugins_sync).await
+}
+
+fn backup_all_plugins_sync() -> Result<String, String> {
+    let _guard = lock_plugin_mutations();
     let plugins_dir = get_target_plugins_dir()?;
     if !plugins_dir.exists() || !plugins_dir.is_dir() {
         return Err("Plugins folder not found.".to_string());
@@ -664,32 +910,19 @@ fn backup_all_plugins() -> Result<String, String> {
     let parent = plugins_dir.parent().ok_or("Invalid plugins path.")?;
     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let zip_path = parent.join(format!("obs-plugins-backup-{}.zip", ts));
-    let file = File::create(&zip_path).map_err(|e| e.to_string())?;
-    let mut zip_writer = zip::ZipWriter::new(BufWriter::new(file));
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
-    for entry in WalkDir::new(&plugins_dir).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_file() {
-            let name_in_zip = path
-                .strip_prefix(&plugins_dir)
-                .unwrap_or(path);
-            let name_str = name_in_zip.to_string_lossy().replace('\\', "/");
-            zip_writer
-                .start_file(&name_str, options)
-                .map_err(|e| e.to_string())?;
-            let mut f = File::open(path).map_err(|e| e.to_string())?;
-            std::io::copy(&mut f, &mut zip_writer).map_err(|e| e.to_string())?;
-        }
-    }
-    zip_writer.finish().map_err(|e| e.to_string())?;
+    zip_directory(&plugins_dir, &zip_path)?;
     log_action(&format!("Backup all: {}", zip_path.display()));
     Ok(zip_path.to_string_lossy().to_string())
 }
 
 /// Uninstalls a plugin (removes folder or .dll). Creates backup if auto_backup is enabled.
 #[tauri::command]
-fn uninstall_plugin(uninstall_path: String) -> Result<(), String> {
+async fn uninstall_plugin(uninstall_path: String) -> Result<(), String> {
+    run_blocking(move || uninstall_plugin_sync(uninstall_path)).await
+}
+
+fn uninstall_plugin_sync(uninstall_path: String) -> Result<(), String> {
+    let _guard = lock_plugin_mutations();
     if load_config().read_only {
         return Err("Read-only mode: uninstall disabled.".to_string());
     }
@@ -703,7 +936,7 @@ fn uninstall_plugin(uninstall_path: String) -> Result<(), String> {
     }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
     if load_config().auto_backup && path.is_dir() {
-        let _ = backup_plugin_folder(uninstall_path.clone());
+        let _ = backup_plugin_folder_inner(uninstall_path.clone());
     }
     log_action(&format!("Uninstall: {}", name));
     if path.is_dir() {
@@ -713,7 +946,8 @@ fn uninstall_plugin(uninstall_path: String) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
+/// JSON dump of config + detected paths + installed plugins (for backup/restore).
+#[tauri::command(async)]
 fn export_config_json() -> Result<String, String> {
     let config = load_config();
     let paths = get_obs_paths();
@@ -735,18 +969,18 @@ fn export_config_json() -> Result<String, String> {
 }
 
 /// Writes a file. Path is user-chosen via save dialog; no server-side validation.
-#[tauri::command]
+#[tauri::command(async)]
 fn write_text_file(path: String, contents: String) -> Result<(), String> {
     std::fs::write(&path, contents).map_err(|e| e.to_string())
 }
 
 /// Reads a file. Path is user-chosen via open dialog; no server-side validation.
-#[tauri::command]
+#[tauri::command(async)]
 fn read_text_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn export_plugins_list_json() -> Result<String, String> {
     let plugins = list_obs_plugins();
     #[derive(Serialize)]
@@ -768,15 +1002,26 @@ fn export_plugins_list_json() -> Result<String, String> {
     serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn export_plugins_list_csv() -> Result<String, String> {
     let plugins = list_obs_plugins();
     let mut csv = String::from("name,path,version,enabled\n");
+    // Every field is quoted, so every embedded quote must be doubled - a plugin
+    // name or version containing `"` would otherwise break the row structure.
+    fn csv_field(value: &str) -> String {
+        value.replace('"', "\"\"")
+    }
     for p in &plugins {
-        let version = p.version.as_deref().unwrap_or("");
         let enabled = if p.enabled { "yes" } else { "no" };
-        let path_esc = p.path.replace('"', "\"\"");
-        csv.push_str(&format!("\"{}\",\"{}\",\"{}\",\"{}\"\n", p.name, path_esc, version, enabled));
+        let row = format!(
+            "\"{}\",\"{}\",\"{}\",\"{}\"",
+            csv_field(&p.name),
+            csv_field(&p.path),
+            csv_field(p.version.as_deref().unwrap_or("")),
+            enabled
+        );
+        csv.push_str(&row);
+        csv.push('\n');
     }
     Ok(csv)
 }
@@ -786,13 +1031,14 @@ fn get_config_dir() -> Option<String> {
     config_dir().map(|p| p.to_string_lossy().to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_log_folder() -> Result<(), String> {
     let dir = config_dir().ok_or("Config directory not found")?;
     open::that(&dir).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+/// Returns plugin-manager.log, creating an empty file if it does not exist yet.
+#[tauri::command(async)]
 fn read_log_file() -> Result<String, String> {
     let path = log_file_path().ok_or("Log file path not found")?;
     if let Some(parent) = path.parent() {
@@ -805,7 +1051,7 @@ fn read_log_file() -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_downloads_folder() -> Result<(), String> {
     let downloads = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
@@ -820,15 +1066,21 @@ fn open_downloads_folder() -> Result<(), String> {
     }
 }
 
+/// Fetch one forum page to verify network / scraping still works.
 #[tauri::command]
-fn test_forum_connection() -> Result<serde_json::Value, String> {
+async fn test_forum_connection() -> Result<serde_json::Value, String> {
+    run_blocking(test_forum_connection_sync).await
+}
+
+fn test_forum_connection_sync() -> Result<serde_json::Value, String> {
     match fetch_forum_plugins_impl("plugins", true, 1) {
         Ok(plugins) => Ok(serde_json::json!({ "count": plugins.len(), "ok": true })),
         Err(e) => Ok(serde_json::json!({ "ok": false, "error": e })),
     }
 }
 
-#[tauri::command]
+/// True if the target plugins folder exists, or its parent does (we can create it).
+#[tauri::command(async)]
 fn check_paths_valid() -> Result<bool, String> {
     let target = match get_target_plugins_dir() {
         Ok(p) => p,
@@ -842,8 +1094,9 @@ fn check_paths_valid() -> Result<bool, String> {
 }
 
 /// Disables a plugin by renaming .dll to .dll.disabled (or folder to folder.disabled).
-#[tauri::command]
+#[tauri::command(async)]
 fn disable_plugin(plugin_path: String) -> Result<(), String> {
+    let _guard = lock_plugin_mutations();
     if load_config().read_only {
         return Err("Read-only mode: disable disabled.".to_string());
     }
@@ -867,8 +1120,9 @@ fn disable_plugin(plugin_path: String) -> Result<(), String> {
 }
 
 /// Re-enables a disabled plugin by removing the .disabled suffix.
-#[tauri::command]
+#[tauri::command(async)]
 fn enable_plugin(plugin_path: String) -> Result<(), String> {
+    let _guard = lock_plugin_mutations();
     if load_config().read_only {
         return Err("Read-only mode: enable disabled.".to_string());
     }
@@ -964,7 +1218,7 @@ fn extract_zip_to_obs(
         if dest_plugin.exists() {
             was_update = true;
             if load_config().auto_backup && dest_plugin.is_dir() && can_write_to_dir(dest_plugin.parent()) {
-                let _ = backup_plugin_folder(dest_plugin.to_string_lossy().to_string());
+                let _ = backup_plugin_folder_inner(dest_plugin.to_string_lossy().to_string());
             }
             if dest_plugin.is_dir() {
                 remove_dir_all_recursive(&dest_plugin)?;
@@ -1014,7 +1268,11 @@ fn extract_zip_to_obs(
 
 /// Downloads a plugin ZIP from URL and extracts it to the OBS plugins folder.
 #[tauri::command]
-fn install_plugin_from_url(url: String) -> Result<InstallFromPathResult, String> {
+async fn install_plugin_from_url(url: String) -> Result<InstallFromPathResult, String> {
+    run_blocking(move || install_plugin_from_url_sync(url)).await
+}
+
+fn install_plugin_from_url_sync(url: String) -> Result<InstallFromPathResult, String> {
     if load_config().read_only {
         return Err("Read-only mode: install disabled.".to_string());
     }
@@ -1032,10 +1290,31 @@ fn install_plugin_from_url(url: String) -> Result<InstallFromPathResult, String>
             return Err(format!("Download failed (code {})", response.status()));
         }
 
+        // The archive is buffered in memory before extraction, so a mistyped URL
+        // pointing at a huge file would otherwise take the whole app down with it.
+        if let Some(len) = response.content_length() {
+            if len > MAX_DOWNLOAD_BYTES {
+                return Err(format!(
+                    "Download refused: {} exceeds the {} MB limit for a plugin archive.",
+                    format_size(len),
+                    MAX_DOWNLOAD_BYTES / (1024 * 1024)
+                ));
+            }
+        }
+
         let bytes = response.bytes().map_err(|e| e.to_string())?.to_vec();
+        if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+            return Err(format!(
+                "Download refused: {} exceeds the {} MB limit for a plugin archive.",
+                format_size(bytes.len() as u64),
+                MAX_DOWNLOAD_BYTES / (1024 * 1024)
+            ));
+        }
         let cursor = std::io::Cursor::new(bytes);
         let archive = zip::ZipArchive::new(cursor).map_err(|e| format!("Invalid ZIP: {}", e))?;
 
+        // Held for extraction only: the download above must not block other mutations.
+        let _guard = lock_plugin_mutations();
         let (name, was_update) = extract_zip_to_obs(archive)?;
         log_action(&format!(
             "{} from URL: {} -> {}",
@@ -1065,7 +1344,12 @@ struct InstallFromPathResult {
 /// Installs or updates a plugin from a local file path (.zip, .dll) or folder.
 /// For zip: if plugin exists, removes old version (with optional backup) then extracts.
 #[tauri::command]
-fn install_plugin_from_path(path: String) -> Result<InstallFromPathResult, String> {
+async fn install_plugin_from_path(path: String) -> Result<InstallFromPathResult, String> {
+    run_blocking(move || install_plugin_from_path_sync(path)).await
+}
+
+fn install_plugin_from_path_sync(path: String) -> Result<InstallFromPathResult, String> {
+    let _guard = lock_plugin_mutations();
     if load_config().read_only {
         return Err("Read-only mode: install disabled.".to_string());
     }
@@ -1098,33 +1382,60 @@ fn install_plugin_from_path(path: String) -> Result<InstallFromPathResult, Strin
             });
         }
         if ext == "dll" {
-            let dest = target_dir.join("64bit").join(src.file_name().unwrap_or(std::ffi::OsStr::new("plugin.dll")));
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            ensure_obs_not_running()?;
+            let file_name = src
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("Invalid DLL file name.")?
+                .to_string();
+            let name = src
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("plugin")
+                .to_string();
+            // OBS loads a bare DLL only from `<plugins>/<name>/bin/64bit/`. Copying it
+            // into `<plugins>/64bit/` leaves it invisible both to OBS and to the scanner
+            // in `find_plugins_in_directory`, which skips a folder named `64bit`.
+            let plugin_root = target_dir.join(&name);
+            let dest_dir = plugin_root.join("bin").join("64bit");
+            let updated = plugin_root.exists();
+            if updated && load_config().auto_backup && can_write_to_dir(plugin_root.parent()) {
+                let _ = backup_plugin_folder_inner(plugin_root.to_string_lossy().to_string());
             }
-            std::fs::copy(src, &dest).map_err(|e| e.to_string())?;
-            let name = src.file_stem().and_then(|s| s.to_str()).unwrap_or("plugin").to_string();
-            log_action(&format!("Installed DLL from file: {} -> {}", path, name));
-            return Ok(InstallFromPathResult {
-                name,
-                updated: false,
-            });
+            std::fs::create_dir_all(&dest_dir)
+                .map_err(|e| format_io_error(e, "create plugin folder"))?;
+            std::fs::copy(src, dest_dir.join(&file_name))
+                .map_err(|e| format_io_error(e, "copy plugin DLL"))?;
+            log_action(&format!(
+                "{} DLL from file: {} -> {}",
+                if updated { "Updated" } else { "Installed" },
+                path,
+                name
+            ));
+            return Ok(InstallFromPathResult { name, updated });
         }
         return Err("Unsupported file type. Use .zip or .dll".to_string());
     }
 
     if src.is_dir() {
+        ensure_obs_not_running()?;
         let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("plugin").to_string();
         let dest = target_dir.join(&name);
-        if dest.exists() {
-            std::fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
+        let updated = dest.exists();
+        if updated {
+            if load_config().auto_backup && can_write_to_dir(dest.parent()) {
+                let _ = backup_plugin_folder_inner(dest.to_string_lossy().to_string());
+            }
+            std::fs::remove_dir_all(&dest).map_err(|e| format_io_error(e, "remove old plugin"))?;
         }
         copy_dir_all(src, &dest)?;
-        log_action(&format!("Installed folder from: {} -> {}", path, name));
-        return Ok(InstallFromPathResult {
-            name,
-            updated: false,
-        });
+        log_action(&format!(
+            "{} folder from: {} -> {}",
+            if updated { "Updated" } else { "Installed" },
+            path,
+            name
+        ));
+        return Ok(InstallFromPathResult { name, updated });
     }
 
     Err("Unsupported path.".to_string())
@@ -1185,7 +1496,7 @@ fn normalize_resource_url(href: &str) -> String {
 fn resource_id_from_url(href: &str) -> Option<String> {
     let href = href.trim().trim_end_matches('/');
     let rest = href.split("/forum/resources/").nth(1)?;
-    let name_part = rest.split('.').last()?;
+    let name_part = rest.split('.').next_back()?;
     if name_part.chars().all(|c| c.is_ascii_digit()) {
         Some(name_part.to_string())
     } else {
@@ -1353,13 +1664,16 @@ fn fetch_forum_resources_page(
 }
 
 #[tauri::command]
-fn fetch_forum_plugins(
+async fn fetch_forum_plugins(
     category: Option<String>,
     force_refresh: Option<bool>,
     max_pages: Option<u32>,
 ) -> Result<Vec<ForumPlugin>, String> {
-    let cat = category.as_deref().unwrap_or("plugins");
-    fetch_forum_plugins_impl(cat, force_refresh.unwrap_or(false), max_pages.unwrap_or(3))
+    run_blocking(move || {
+        let cat = category.as_deref().unwrap_or("plugins");
+        fetch_forum_plugins_impl(cat, force_refresh.unwrap_or(false), max_pages.unwrap_or(3))
+    })
+    .await
 }
 
 fn fetch_forum_plugins_impl(
@@ -1376,7 +1690,7 @@ fn fetch_forum_plugins_impl(
     let client = http_client(30)?;
 
     let mut by_id: HashMap<String, ForumPlugin> = HashMap::new();
-    let pages = max_pages.max(1).min(5);
+    let pages = max_pages.clamp(1, 5);
 
     for page in 1..=pages {
         match fetch_forum_resources_page(&client, category, page) {
@@ -1396,13 +1710,17 @@ fn fetch_forum_plugins_impl(
     }
 
     let mut list: Vec<ForumPlugin> = by_id.into_values().collect();
-    list.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    list.sort_by_key(|a| a.title.to_lowercase());
     save_forum_cache(category, &list);
     Ok(list)
 }
 
 #[tauri::command]
-fn search_forum_resources(keywords: String) -> Result<Vec<ForumPlugin>, String> {
+async fn search_forum_resources(keywords: String) -> Result<Vec<ForumPlugin>, String> {
+    run_blocking(move || search_forum_resources_sync(keywords)).await
+}
+
+fn search_forum_resources_sync(keywords: String) -> Result<Vec<ForumPlugin>, String> {
     let kw = keywords.trim().to_lowercase();
     if kw.is_empty() {
         return Ok(Vec::new());
@@ -1414,8 +1732,8 @@ fn search_forum_resources(keywords: String) -> Result<Vec<ForumPlugin>, String> 
         if let Ok(plugins) = fetch_forum_resources_page(&client, category, 1) {
             for p in plugins {
                 let matches = p.title.to_lowercase().contains(&kw)
-                    || p.author.as_ref().map_or(false, |a| a.to_lowercase().contains(&kw))
-                    || p.description.as_ref().map_or(false, |d| d.to_lowercase().contains(&kw));
+                    || p.author.as_ref().is_some_and(|a| a.to_lowercase().contains(&kw))
+                    || p.description.as_ref().is_some_and(|d| d.to_lowercase().contains(&kw));
                 if matches {
                     by_id.entry(p.id.clone()).or_insert(p);
                 }
@@ -1424,7 +1742,7 @@ fn search_forum_resources(keywords: String) -> Result<Vec<ForumPlugin>, String> 
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
     let mut list: Vec<ForumPlugin> = by_id.into_values().collect();
-    list.sort_by(|a, b| b.downloads.unwrap_or(0).cmp(&a.downloads.unwrap_or(0)));
+    list.sort_by_key(|p| std::cmp::Reverse(p.downloads.unwrap_or(0)));
     Ok(list)
 }
 
@@ -1456,7 +1774,11 @@ fn version_compare(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 #[tauri::command]
-fn check_plugin_updates() -> Result<Vec<PluginUpdateInfo>, String> {
+async fn check_plugin_updates() -> Result<Vec<PluginUpdateInfo>, String> {
+    run_blocking(check_plugin_updates_sync).await
+}
+
+fn check_plugin_updates_sync() -> Result<Vec<PluginUpdateInfo>, String> {
     let installed = list_obs_plugins();
     let forum = fetch_forum_plugins_impl("plugins", false, 2)?;
     let mut updates = Vec::new();
@@ -1492,7 +1814,11 @@ fn check_plugin_updates() -> Result<Vec<PluginUpdateInfo>, String> {
 
 /// Fetches available download options for a forum resource (forum files + GitHub releases).
 #[tauri::command]
-fn fetch_plugin_download_options(resource_url: String) -> Result<Vec<DownloadOption>, String> {
+async fn fetch_plugin_download_options(resource_url: String) -> Result<Vec<DownloadOption>, String> {
+    run_blocking(move || fetch_plugin_download_options_sync(resource_url)).await
+}
+
+fn fetch_plugin_download_options_sync(resource_url: String) -> Result<Vec<DownloadOption>, String> {
     let client = http_client(30)?;
 
     let mut options = Vec::new();
@@ -1557,10 +1883,8 @@ fn fetch_plugin_download_options(resource_url: String) -> Result<Vec<DownloadOpt
     // Step 3: Fetch GitHub releases API for .zip/.exe assets
     if let Some(gh) = github_url {
         if let Some((owner, repo)) = parse_github_repo(&gh) {
-            let api_url = format!(
-                "https://api.github.com/repos/{}/releases/latest",
-                format!("{}/{}", owner, repo)
-            );
+            let api_url =
+                format!("https://api.github.com/repos/{}/{}/releases/latest", owner, repo);
             if let Ok(resp) = client.get(&api_url).header("Accept", "application/vnd.github.v3+json").send() {
                 if let Ok(json) = resp.json::<serde_json::Value>() {
                     if let Some(assets) = json.get("assets").and_then(|a| a.as_array()) {
@@ -1620,18 +1944,107 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Sets `enabled` on every entry named `module_name`, returning the new file text.
+///
+/// Entries are edited as raw `Value`s so fields this app does not model - OBS is
+/// free to add more - survive the rewrite untouched.
+fn set_enabled_in_modules_json(
+    raw: &str,
+    module_name: &str,
+    enabled: bool,
+) -> Result<String, String> {
+    let mut modules: Vec<serde_json::Value> =
+        serde_json::from_str(raw).map_err(|e| format!("Unexpected modules.json format: {}", e))?;
+
+    let mut found = false;
+    for module in modules.iter_mut() {
+        let matches = module
+            .get("module_name")
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| n == module_name);
+        if matches {
+            if let Some(obj) = module.as_object_mut() {
+                obj.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
+                found = true;
+            }
+        }
+    }
+    if !found {
+        return Err(format!("OBS does not list a module named {}.", module_name));
+    }
+    serde_json::to_string_pretty(&modules).map_err(|e| e.to_string())
+}
+
+/// Returns OBS 32's own module list, or an empty list when OBS does not track one.
+#[tauri::command(async)]
+fn get_obs_modules() -> Vec<ObsModuleInfo> {
+    load_obs_modules()
+}
+
+/// Path of the OBS modules.json this app reads, for the diagnostics panel.
+#[tauri::command(async)]
+fn get_obs_modules_path() -> Option<String> {
+    obs_modules_json_path()
+        .filter(|p| p.is_file())
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Flips a module's `enabled` flag in OBS's own plugin manager state.
+///
+/// This is the mechanism OBS 32 itself uses, so unlike renaming a folder to
+/// `.disabled` it stays consistent with what OBS shows. The file is rewritten
+/// from parsed `Value`s so any field this app does not model is preserved.
 #[tauri::command]
+async fn set_module_enabled(module_name: String, enabled: bool) -> Result<(), String> {
+    run_blocking(move || set_module_enabled_sync(module_name, enabled)).await
+}
+
+fn set_module_enabled_sync(module_name: String, enabled: bool) -> Result<(), String> {
+    if load_config().read_only {
+        return Err("Read-only mode: changing modules is disabled.".to_string());
+    }
+    // OBS rewrites this file when it exits, which would silently undo the change.
+    ensure_obs_not_running()?;
+    let _guard = lock_plugin_mutations();
+
+    let path = obs_modules_json_path().ok_or("OBS configuration folder not found.")?;
+    if !path.is_file() {
+        return Err(
+            "OBS does not expose a plugin manager state file. This needs OBS Studio 32 or newer."
+                .to_string(),
+        );
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| format_io_error(e, "read modules.json"))?;
+    let json = set_enabled_in_modules_json(&raw, &module_name, enabled)?;
+
+    // Keep one restore point next to the file before the first rewrite.
+    let backup = path.with_extension("json.lamaworlds-backup");
+    if !backup.exists() {
+        let _ = std::fs::copy(&path, &backup);
+    }
+
+    std::fs::write(&path, json).map_err(|e| format_io_error(e, "write modules.json"))?;
+    log_action(&format!(
+        "OBS module {}: {}",
+        module_name,
+        if enabled { "enabled" } else { "disabled" }
+    ));
+    Ok(())
+}
+
+#[tauri::command(async)]
 fn get_favorites() -> Vec<String> {
     load_config().forum_favorites
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_favorites(ids: Vec<String>) -> Result<(), String> {
     let mut config = load_config();
     config.forum_favorites = ids;
     save_config(&config)
 }
 
+/// Hardcoded popular plugins (fallback; Discover uses the live forum scrape).
 #[tauri::command]
 fn get_plugin_catalog() -> Vec<CatalogPlugin> {
     vec![
@@ -1680,12 +2093,23 @@ fn get_plugin_catalog() -> Vec<CatalogPlugin> {
     ]
 }
 
-#[tauri::command]
+/// Opens a web URL in the default browser.
+///
+/// Restricted to http/https: forum URLs are scraped from untrusted HTML, and
+/// `open::that` on Windows would happily launch a local executable or a
+/// `file:`/`shell:` target handed to it.
+#[tauri::command(async)]
 fn open_url(url: String) -> Result<(), String> {
-    open::that(&url).map_err(|e| e.to_string())
+    let trimmed = url.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    if !(lowered.starts_with("http://") || lowered.starts_with("https://")) {
+        return Err(format!("Refused to open non-web URL: {}", trimmed));
+    }
+    open::that(trimmed).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+/// Open the plugins dir in Explorer; creates it if missing.
+#[tauri::command(async)]
 fn open_plugins_folder(folder_override: Option<String>) -> Result<(), String> {
     let folder = folder_override.or_else(|| {
         get_target_plugins_dir().ok().map(|p| p.to_string_lossy().to_string())
@@ -1696,7 +2120,7 @@ fn open_plugins_folder(folder_override: Option<String>) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::create_dir_all(&path);
+        let _ = std::fs::create_dir_all(path);
     }
     if !path.exists() {
         return Err(format!("Could not create folder: {}. Check path in Options.", folder));
@@ -1743,8 +2167,168 @@ pub fn run() {
             open_log_folder,
             read_log_file,
             open_downloads_folder,
-            test_forum_connection
+            test_forum_connection,
+            get_obs_modules,
+            get_obs_modules_path,
+            set_module_enabled
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shaped like a real OBS 32 modules.json, including a field this app does
+    /// not model (`id`) and the " (N)" suffix OBS appends to duplicate modules.
+    const SAMPLE: &str = r#"[
+      {"display_name":"","enabled":true,"encoders":[],"id":"","module_name":"tuna",
+       "outputs":[],"services":[],"sources":["progress_bar"],"version":""},
+      {"display_name":"APPLET_OBS_NAME","enabled":true,"encoders":[],"id":"",
+       "module_name":"logi_obs_plugin_x64 (1)","outputs":[],"services":[],
+       "sources":[],"version":""}
+    ]"#;
+
+    fn plugin(name: &str, modules: &[&str]) -> ObsPluginInfo {
+        ObsPluginInfo {
+            name: name.to_string(),
+            path: String::new(),
+            uninstall_path: String::new(),
+            enabled: true,
+            version: None,
+            modified_time: None,
+            module_names: modules.iter().map(|m| m.to_string()).collect(),
+            obs_enabled: None,
+            obs_managed: false,
+            obs_display_name: None,
+            support_dll: false,
+        }
+    }
+
+    #[test]
+    fn parses_obs_module_list() {
+        let modules: Vec<ObsModuleInfo> = serde_json::from_str(SAMPLE).unwrap();
+        assert_eq!(modules.len(), 2);
+        assert_eq!(modules[0].module_name, "tuna");
+        assert_eq!(modules[0].sources, vec!["progress_bar".to_string()]);
+        assert_eq!(
+            modules[1].display_name.as_deref(),
+            Some("APPLET_OBS_NAME")
+        );
+    }
+
+    #[test]
+    fn a_bare_dll_that_obs_ignores_is_not_a_plugin() {
+        let modules: Vec<ObsModuleInfo> = serde_json::from_str(SAMPLE).unwrap();
+        let mut builtin = plugin("obs-ffmpeg", &["obs-ffmpeg"]);
+        builtin.uninstall_path = "C:/obs/obs-plugins/64bit/obs-ffmpeg.dll".to_string();
+        let mut tracked = plugin("tuna", &["tuna"]);
+        tracked.uninstall_path = "C:/obs/obs-plugins/64bit/tuna.dll".to_string();
+        // A folder plugin OBS has not loaded yet: unknown, but never a built-in.
+        let mut fresh = plugin("brand-new", &["brand-new"]);
+        fresh.uninstall_path = "C:/obs/plugins/brand-new".to_string();
+
+        let mut plugins = vec![builtin, tracked, fresh];
+        apply_module_states(&mut plugins, &modules);
+
+        assert!(plugins[0].support_dll, "OBS built-in should be flagged");
+        assert!(!plugins[1].support_dll, "a tracked module is not a support DLL");
+        assert!(
+            !plugins[2].support_dll,
+            "a folder plugin awaiting its first OBS launch must not be flagged"
+        );
+    }
+
+    #[test]
+    fn marks_plugins_that_obs_tracks() {
+        let modules: Vec<ObsModuleInfo> = serde_json::from_str(SAMPLE).unwrap();
+        let mut plugins = vec![
+            plugin("tuna", &["tuna"]),
+            plugin("obs-ffmpeg", &["obs-ffmpeg"]),
+        ];
+        apply_module_states(&mut plugins, &modules);
+
+        assert!(plugins[0].obs_managed);
+        assert_eq!(plugins[0].obs_enabled, Some(true));
+        // A built-in OBS module has no entry, so it must stay unmanaged: the UI
+        // relies on this to keep users from uninstalling part of OBS itself.
+        assert!(!plugins[1].obs_managed);
+        assert_eq!(plugins[1].obs_enabled, None);
+    }
+
+    #[test]
+    fn a_plugin_is_enabled_only_when_all_its_modules_are() {
+        let raw = set_enabled_in_modules_json(SAMPLE, "tuna", false).unwrap();
+        let modules: Vec<ObsModuleInfo> = serde_json::from_str(&raw).unwrap();
+        let mut plugins = vec![plugin("bundle", &["tuna", "logi_obs_plugin_x64 (1)"])];
+        apply_module_states(&mut plugins, &modules);
+        assert_eq!(plugins[0].obs_enabled, Some(false));
+    }
+
+    #[test]
+    fn disabling_preserves_unmodelled_fields() {
+        let updated = set_enabled_in_modules_json(SAMPLE, "tuna", false).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&updated).unwrap();
+        let first = &value[0];
+        assert_eq!(first["enabled"], serde_json::Value::Bool(false));
+        // `id`, `outputs`, `services` and `encoders` are round-tripped even
+        // though ObsModuleInfo does not declare them.
+        assert!(first.get("id").is_some(), "id field was dropped");
+        assert!(first.get("outputs").is_some(), "outputs field was dropped");
+        assert!(first.get("services").is_some(), "services field was dropped");
+        assert!(first.get("encoders").is_some(), "encoders field was dropped");
+        // Untouched entries keep their state.
+        assert_eq!(value[1]["enabled"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn rejects_an_unknown_module() {
+        let err = set_enabled_in_modules_json(SAMPLE, "not-installed", false).unwrap_err();
+        assert!(err.contains("not-installed"), "unhelpful error: {}", err);
+    }
+
+    #[test]
+    fn module_names_come_from_dll_stems() {
+        let dir = std::env::temp_dir().join("lamaworlds_module_names_test");
+        let bin = dir.join("bin").join("64bit");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("my-plugin.dll"), b"").unwrap();
+        std::fs::write(bin.join("my-plugin.pdb"), b"").unwrap();
+
+        let mut names = module_names_for(&dir);
+        names.sort();
+        assert_eq!(names, vec!["my-plugin".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn module_name_of_a_disabled_legacy_dll_drops_both_suffixes() {
+        let dir = std::env::temp_dir().join("lamaworlds_disabled_dll_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let disabled = dir.join("tuna.dll.disabled");
+        std::fs::write(&disabled, b"").unwrap();
+        let active = dir.join("obs-shaderfilter.dll");
+        std::fs::write(&active, b"").unwrap();
+
+        // A disabled plugin must still resolve to the module name OBS knows,
+        // otherwise re-enabling it could never be matched back to modules.json.
+        assert_eq!(module_names_for(&disabled), vec!["tuna".to_string()]);
+        assert_eq!(
+            module_names_for(&active),
+            vec!["obs-shaderfilter".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn version_comparison_orders_releases() {
+        use std::cmp::Ordering;
+        assert_eq!(version_compare("1.2.0", "1.10.0"), Ordering::Less);
+        assert_eq!(version_compare("v2.0", "1.9.9"), Ordering::Greater);
+        assert_eq!(version_compare("1.0.0", "1.0.0"), Ordering::Equal);
+    }
+
 }

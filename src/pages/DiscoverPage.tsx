@@ -1,3 +1,7 @@
+/**
+ * Discover — OBS forum catalog with category sidebar, local + API search,
+ * favorites, install modal, and configurable scrape depth.
+ */
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import type {
   ForumPlugin,
@@ -6,8 +10,9 @@ import type {
   DiscoverView,
   DownloadOption,
 } from "../types";
-import { PLUGINS_PER_PAGE } from "../types";
+import { PLUGINS_PER_PAGE, FORUM_CATEGORIES } from "../types";
 import { invoke } from "../tauriApi";
+import { formatDownloads, pluginNamesMatch } from "../utils/format";
 import { t } from "../i18n";
 
 const SIDEBAR_CAT_META: Record<ForumCategory, { icon: string; color: string }> = {
@@ -26,10 +31,18 @@ function catLabel(cat: ForumCategory): string {
   }
 }
 
-/**
- * Discover — store-style page with sidebar nav, search hero, grid/list toggle,
- * configurable scrape depth (1–15 pages), tag cloud, and skeleton loading.
- */
+export interface DiscoverPageProps {
+  installedPluginNames: string[];
+  favorites: string[];
+  searchInputRef: React.RefObject<HTMLInputElement | null>;
+  onToggleFavorite: (forumId: string) => void;
+  onOpenForum: () => void;
+  onOpenPluginUrl: (url: string) => void;
+  onInstallFromUrl: (url: string) => void | Promise<void>;
+  onTestForum: () => void;
+  readOnly: boolean;
+}
+
 export function DiscoverPage({
   installedPluginNames,
   favorites,
@@ -40,17 +53,7 @@ export function DiscoverPage({
   onInstallFromUrl,
   onTestForum,
   readOnly,
-}: {
-  installedPluginNames: string[];
-  favorites: string[];
-  searchInputRef: React.RefObject<HTMLInputElement | null>;
-  onToggleFavorite: (forumId: string) => void;
-  onOpenForum: () => void;
-  onOpenPluginUrl: (url: string) => void;
-  onInstallFromUrl: (url: string) => void;
-  onTestForum: () => void;
-  readOnly: boolean;
-}) {
+}: DiscoverPageProps) {
   // ── data
   const [forumPlugins, setForumPlugins]     = useState<ForumPlugin[]>([]);
   const [forumLoading, setForumLoading]     = useState(false);
@@ -73,9 +76,14 @@ export function DiscoverPage({
   const [downloadModal, setDownloadModal] = useState<{
     plugin: ForumPlugin; options: DownloadOption[]; loading: boolean; error?: string;
   } | null>(null);
+  /** Index of the download option currently installing, so the modal can block re-clicks. */
+  const [installingOption, setInstallingOption] = useState<number | null>(null);
 
-  // ── debounce live search (local filter, not API)
+  // Local filter is debounced; Enter still fires an API search immediately.
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+  }, []);
   const handleSearchChange = (val: string) => {
     setForumSearch(val);
     setCurrentPage(1);
@@ -107,10 +115,14 @@ export function DiscoverPage({
     } finally {
       setForumLoading(false);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [forumCategory, maxPages]);
 
-  useEffect(() => { loadForumPlugins(false); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+  // Load once on mount; later category/depth changes are explicit user actions.
+  const loadForumRef = useRef(loadForumPlugins);
+  loadForumRef.current = loadForumPlugins;
+  useEffect(() => {
+    void loadForumRef.current(false);
+  }, []);
 
   // ── API search
   const searchForum = useCallback(async () => {
@@ -133,6 +145,7 @@ export function DiscoverPage({
   // ── download modal
   const openDownloadModal = useCallback(async (plugin: ForumPlugin) => {
     if (readOnly) return;
+    setInstallingOption(null);
     setDownloadModal({ plugin, options: [], loading: true });
     try {
       const opts = await invoke<DownloadOption[]>("fetch_plugin_download_options", { resourceUrl: plugin.url });
@@ -143,12 +156,10 @@ export function DiscoverPage({
   }, [readOnly]);
 
   // ── helpers
-  const isInstalled = useCallback((title: string) => {
-    const lower = title.toLowerCase();
-    return installedPluginNames.some(n =>
-      n.toLowerCase() === lower || lower.includes(n.toLowerCase()) || n.toLowerCase().includes(lower)
-    );
-  }, [installedPluginNames]);
+  const isInstalled = useCallback(
+    (title: string) => installedPluginNames.some((n) => pluginNamesMatch(title, n)),
+    [installedPluginNames],
+  );
 
   // ── tag cloud from prefix field
   const tagCloud = useMemo(() => {
@@ -253,10 +264,27 @@ export function DiscoverPage({
                           {opt.source && <span className="dsc-dl-meta">{opt.source}</span>}
                         </div>
                       </div>
-                      <button type="button" className="btn btn-primary btn-sm" onClick={async () => {
-                        try { await onInstallFromUrl(opt.url); setDownloadModal(null); } catch {}
-                      }}>
-                        <i className="ti ti-download" /> {t.install}
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        disabled={installingOption !== null}
+                        onClick={async () => {
+                          setInstallingOption(i);
+                          try {
+                            await onInstallFromUrl(opt.url);
+                            setDownloadModal(null);
+                          } catch {
+                            /* the shell shows the error banner */
+                          } finally {
+                            setInstallingOption(null);
+                          }
+                        }}
+                      >
+                        {installingOption === i ? (
+                          <><span className="dsc-btn-spinner" /> {t.installing}</>
+                        ) : (
+                          <><i className="ti ti-download" /> {t.install}</>
+                        )}
                       </button>
                     </li>
                   ))}
@@ -306,7 +334,7 @@ export function DiscoverPage({
           {/* categories */}
           <p className="dsc-sb-label">{t.browseCat}</p>
           <nav className="dsc-sb-nav" aria-label={t.categories}>
-            {(["plugins","themes","tools","scripts"] as ForumCategory[]).map(cat => {
+            {FORUM_CATEGORIES.map(cat => {
               const m = SIDEBAR_CAT_META[cat];
               const active = forumCategory === cat && !isSearchMode;
               return (
@@ -435,13 +463,7 @@ export function DiscoverPage({
               </div>
               <div className="dsc-stat-sep" />
               <div className="dsc-stat-item">
-                <span className="dsc-stat-num">
-                  {totalDownloads >= 1_000_000
-                    ? `${(totalDownloads / 1_000_000).toFixed(1)}M`
-                    : totalDownloads >= 1000
-                    ? `${(totalDownloads / 1000).toFixed(0)}k`
-                    : totalDownloads.toLocaleString()}
-                </span>
+                <span className="dsc-stat-num">{formatDownloads(totalDownloads)}</span>
                 <span className="dsc-stat-lbl">{t.totalDownloads}</span>
               </div>
               <div className="dsc-stat-sep" />
@@ -562,7 +584,7 @@ export function DiscoverPage({
                         <div className="dsc-row-meta">
                           {p.author && <span><i className="ti ti-user" /> {p.author}</span>}
                           {p.version && <span>v{p.version}</span>}
-                          {p.downloads != null && <span><i className="ti ti-download" /> {p.downloads >= 1000 ? `${(p.downloads/1000).toFixed(1)}k` : p.downloads}</span>}
+                          {p.downloads != null && <span><i className="ti ti-download" /> {formatDownloads(p.downloads)}</span>}
                           {p.rating && <span className="dsc-stat--star"><i className="ti ti-star" /> {p.rating}{p.rating_count ? ` (${p.rating_count})` : ""}</span>}
                           {p.updated && <span><i className="ti ti-clock" /> {p.updated}</span>}
                         </div>
@@ -602,7 +624,7 @@ export function DiscoverPage({
                     {p.prefix && <span className="dsc-prefix">{p.prefix}</span>}
                     {p.description && <p className="dsc-card-desc">{p.description}</p>}
                     <div className="dsc-card-stats">
-                      {p.downloads != null && <span className="dsc-stat"><i className="ti ti-download" />{p.downloads >= 1000 ? `${(p.downloads/1000).toFixed(1)}k` : p.downloads}</span>}
+                      {p.downloads != null && <span className="dsc-stat"><i className="ti ti-download" />{formatDownloads(p.downloads)}</span>}
                       {p.rating && <span className="dsc-stat dsc-stat--star"><i className="ti ti-star" />{p.rating}</span>}
                       {p.updated && <span className="dsc-stat"><i className="ti ti-clock" />{p.updated}</span>}
                       {p.version && <span className="dsc-stat dsc-stat--version">v{p.version}</span>}

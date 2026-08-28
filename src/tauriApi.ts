@@ -1,9 +1,6 @@
 /**
- * Safe Tauri API wrapper for the OBS Plugin Manager.
- *
- * - Wraps invoke to handle missing Tauri runtime (e.g. when running in browser)
- * - Provides openFolderDialog helper for directory selection
- * - Throws a clear error when Tauri is not available
+ * Tauri invoke wrapper. `npm run dev` (browser only) has no Rust runtime,
+ * so we fail with a clear "run tauri dev" message instead of a cryptic crash.
  */
 
 declare global {

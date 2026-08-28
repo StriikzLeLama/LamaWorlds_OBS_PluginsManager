@@ -10,6 +10,7 @@ interface State {
   info: ErrorInfo | null;
 }
 
+/** Catches render errors so the whole desktop window is not a blank page. */
 export class ErrorBoundary extends Component<Props, State> {
   constructor(props: Props) {
     super(props);

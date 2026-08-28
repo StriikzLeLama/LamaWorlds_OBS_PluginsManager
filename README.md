@@ -46,6 +46,11 @@ Open http://localhost:1420 — Rust commands will not work in the browser.
 - **Discover** — OBS forum catalog (plugins/themes/tools/scripts), favorites, tags, install via download modal
 - **Logs** — Session action timeline + backend `plugin-manager.log`
 - **Options** — Custom OBS paths, theme (dark/light/system), language (EN/FR), auto-backup, read-only mode, profiles, config import/export
+- **OBS module integration** — reads OBS 32's own plugin manager state
+  (`<obs-config>/plugin_manager/modules.json`) to show the enabled state OBS
+  actually sees, flag DLLs that are not plugins (OBS built-ins and helper
+  libraries) so they cannot be removed by mistake, and toggle a module the same
+  way OBS does instead of renaming its folder
 - OBS running detection and path validation
 - Collapsible sidebar, keyboard shortcuts
 
@@ -59,6 +64,7 @@ Open http://localhost:1420 — Rust commands will not work in the browser.
 | Ctrl+I | Import plugin file |
 | Ctrl+1–4 | Home / Discover / Options / Logs |
 | Ctrl+D | Discover |
+| Ctrl+Shift+O | Options |
 | Esc | Clear toast / error |
 
 ## Project structure
@@ -72,9 +78,18 @@ src/
   i18n.ts              # EN / FR strings
   App.css              # Theme + layout
 src-tauri/
-  src/lib.rs           # Tauri commands (filesystem, forum, install)
+  src/lib.rs           # Tauri commands (filesystem, forum, install, OBS modules)
 ```
 
 ## Icons
 
 Regenerate from logo: `npx tauri icon public/logo_64x64.png`
+
+## Tests
+
+```bash
+cd src-tauri && cargo test
+```
+
+Covers OBS module parsing, the built-in/support-DLL classification, and the
+modules.json rewrite (which must preserve fields this app does not model).

@@ -649,6 +649,22 @@ code, .opt-code, .hp-item-path, .hp-gc-path, .hpath-chip code {
   border-radius: 4px; color: var(--accent);
   display: flex; align-items: center; gap: 0.2rem;
 }
+/* OBS module state: built-in DLLs are locked, mismatches need attention. */
+.hp-badge-builtin {
+  font-size: 0.68rem; padding: 0.05rem 0.35rem;
+  background: var(--surface-2); border: 1px solid var(--border-strong);
+  border-radius: 4px; color: var(--text-muted);
+  display: inline-flex; align-items: center; gap: 0.2rem;
+}
+.hp-badge-mismatch {
+  font-size: 0.68rem; padding: 0.05rem 0.35rem;
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  border: 1px solid var(--warning);
+  border-radius: 4px; color: var(--warning);
+  display: inline-flex; align-items: center; gap: 0.2rem;
+}
+.hp-detail-builtin { color: var(--text-muted); }
+
 .hp-item-path {
   font-size: 0.73rem; color: var(--text-muted);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
